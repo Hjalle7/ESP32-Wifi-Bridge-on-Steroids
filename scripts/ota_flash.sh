@@ -10,8 +10,9 @@
 #
 # Usage: scripts/ota_flash.sh <ip> <admin-key> [pio-env]
 #
-# pio-env defaults to wt32-eth01-4mb; pass nicemcu-c5-w5500 for the ESP32-C5
-# board. The portal must be entered physically before uploading. A first
+# Only wt32-eth01-4mb is supported for QE4 deployment. Legacy environment
+# options are retained for compatibility, not product validation. Enter the
+# portal physically before uploading. A first
 # 4 MB installation needs a cable and the matching partition table.
 # The device rejects an image built for a different chip, but picking
 # the environment explicitly avoids the failed upload in the first place.

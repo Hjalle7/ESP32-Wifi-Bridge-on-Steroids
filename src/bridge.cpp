@@ -232,6 +232,9 @@ static char s_client_name[32] = "";
 
 static volatile uint32_t s_pkt_e2w = 0, s_pkt_w2e = 0;
 static volatile uint32_t s_drop_e2w = 0, s_drop_w2e = 0;
+/* Written only by eth_rx_cb after failed Wi-Fi transmit attempts. Keep
+ * policy/offline drops in s_drop_e2w for telemetry, not fault recovery. */
+static volatile uint32_t s_fail_e2w = 0;
 static volatile uint64_t s_by_e2w = 0, s_by_w2e = 0;
 static uint32_t s_kbps_e2w = 0, s_kbps_w2e = 0;
 
@@ -754,6 +757,7 @@ IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
       if (i < 3) taskYIELD();
       else       eth_tx_retry_wait();
     }
+    if (err != ESP_OK) s_fail_e2w = s_fail_e2w + 1;
   }
 
   if (err == ESP_OK) { s_pkt_e2w = s_pkt_e2w + 1; s_by_e2w += len; }
@@ -2983,7 +2987,7 @@ static void watchdog_tick(void) {
 
   const uint32_t now = millis();
   if (s_wd_t0 == 0) {
-    s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_drop_e2w;
+    s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_fail_e2w;
     s_wd_disc0 = s_wifi_disc_count;
     s_wd_eth_pkt0 = s_pkt_w2e; s_wd_eth_drop0 = s_drop_w2e;
     return;
@@ -2991,9 +2995,9 @@ static void watchdog_tick(void) {
   if (now - s_wd_t0 < WD_WINDOW_MS) return;
 
   const uint32_t dp    = s_pkt_e2w - s_wd_pkt0;
-  const uint32_t dd    = s_drop_e2w - s_wd_drop0;
+  const uint32_t dd    = s_fail_e2w - s_wd_drop0;
   const uint32_t ddisc = s_wifi_disc_count - s_wd_disc0;
-  s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_drop_e2w;
+  s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_fail_e2w;
   s_wd_disc0 = s_wifi_disc_count;
 
   const uint32_t ep = s_pkt_w2e - s_wd_eth_pkt0;
