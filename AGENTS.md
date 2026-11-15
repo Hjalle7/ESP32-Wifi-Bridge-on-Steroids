@@ -2,10 +2,10 @@
 
 Instructions for coding agents and reviewers. **This fork's requirements take precedence over inherited upstream documentation, build targets, examples and assumptions.** Read this file and the actual source/configuration before making claims. Do not treat intended functionality as implemented.
 
-## Scope and hardware (mandatory)
+## Project scope and hardware
 
 - **Only supported product target: WT32-ETH01, classic ESP32 with LAN8720 Ethernet PHY and 2.4 GHz Wi-Fi, using a 4 MB flash configuration.** The actual flash chip on the purchased board must be checked with `esptool flash-id` before flashing. Do not assume the original author's measured 8 MB chip applies to this board.
-- **Out of scope:** ESP32-C5, NiceMCU, W5500, ESP32-S3, dual-band/5 GHz features, original 8 MB WT32 hardware, and IP-camera-specific performance tuning. Do not review, build, test, or fix these targets unless a change to shared code demonstrably affects the supported WT32 target; explain any exception.
+- Do not develop or test unrelated hardware targets, including ESP32-C5/W5500 and 8 MB variants. They are not product requirements. Only inspect legacy code when needed to remove it safely or to assess shared-code regressions.
 - The existing `platformio.ini` still defines an 8 MB WT32 build and a C5/W5500 build. **These are legacy configurations, not evidence that either is a supported target.** Before hardware flashing, implement and validate a 4 MB-compatible partition table, OTA slots, image header, sdkconfig and PlatformIO settings. Do not flash an 8 MB image to a 4 MB chip.
 - Preserve ESP-IDF via PlatformIO (no Arduino) unless a specific change is approved. Keep existing bridge implementation; avoid a wholesale rewrite.
 
@@ -42,6 +42,24 @@ The device provides an Ethernet-to-Wi-Fi bridge for a **Qvantum QE4 heat pump**,
 - Build the supported 4 MB configuration once it exists. Hardware validation must cover: cold boot, MAC cloning, DHCP/ARP, bidirectional Modbus TCP, idle client, MQTT broker outage/reconnect, Wi-Fi loss/recovery, provisioning without reset, saved configuration migration, and firmware update/rollback if supported.
 - If hardware is unavailable, report **not hardware-tested**; do not claim production readiness.
 
+## Legacy implementation to change or remove
+
+This is a **migration checklist**, not a list of features to preserve. Verify each item against the current branch and open PRs before changing it. Remove an item from this checklist once the code and configuration are updated and verified. Keep historical explanations in Git history or `docs/content/history.md`, not in this file.
+
+| Existing or inherited behavior | Required disposition |
+| --- | --- |
+| WT32 build assumes 8 MB flash and uses `partitions_8mb_ota.csv` | Replace with a validated 4 MB configuration, including image header and viable OTA/rollback strategy. Confirm the actual chip first. |
+| Additional ESP32-C5/W5500 build target | Remove from the supported build/review workflow; delete target-specific code/config only when safe for the WT32 build. |
+| HTTP management server and API available in normal bridge mode | Disable/remove normal-mode listeners; keep administration and diagnostics in provisioning only. Preserve outbound MQTT connectivity. |
+| Shared/default setup AP password | Replace with secure first-use provisioning credentials/enrollment. |
+| Factory-reset GPIO also used to enter setup | Provide a separate non-destructive provisioning path; retain an intentional factory reset. |
+| Gateway ping used by watchdog | Replace health detection with local link/driver signals, with idle-client protection and staged recovery. |
+| Gateway ping used to identify network profile | Remove or redesign independently of watchdog; verify need for multiple profiles. |
+| IP-camera-centric tuning, multi-site/5 GHz features and obsolete diagnostics | Keep only if justified for the QE4 and supported hardware. Avoid deleting shared behavior without checking dependencies and NVS compatibility. |
+| HTTP OTA endpoint reachable in normal mode | Move to provisioning-only OTA or replace with USB flashing; revalidate 4 MB partition and rollback constraints. |
+
+Do not assume any checklist item is still present after PR #2–#4. Review the actual code and mark it resolved only after evidence. This checklist describes **work to inspect**, not confirmed bugs in every branch.
+
 ## Repository navigation and source of truth
 
 - `platformio.ini`, `sdkconfig.defaults`, `sdkconfig.wt32-eth01`, partition CSV files: inspect **actual** build settings; inherited 8 MB/C5 definitions need cleanup as separate implementation work.
@@ -51,15 +69,14 @@ The device provides an Ethernet-to-Wi-Fi bridge for a **Qvantum QE4 heat pump**,
 - `src/telemetry.cpp`: MQTT state and Home Assistant discovery.
 - `src/main.cpp`: startup, provisioning lifecycle, recovery/OTA confirmation.
 - `docs/content/handoff.md`, `docs/content/backlog.md`, `docs/content/history.md`: inherited implementation notes and history; they may describe the original camera/8 MB/C5 setup and **are not current requirements for this fork**. Update handoff/backlog when implementation status changes.
-- The original AGENTS.md contained detailed historical 8 MB measurements, C5 wiring, camera-specific tuning and an always-on management API. Those statements described upstream hardware/firmware and must **not** be used as design requirements for this fork.
 
-## Open decisions (do not silently invent answers)
+## Unresolved project decisions
 
 1. Confirm actual flash size and establish a safe 4 MB partition/OTA plan.
 2. Choose the non-destructive provisioning entry/exit mechanism and secure AP enrollment.
 3. Choose provisioning-only OTA vs serial-only updates and define rollback behavior.
 4. Verify ARP/frame demultiplexing for ESP32 telemetry IP alongside the cloned heat-pump MAC.
-5. Decide whether legacy multi-site profiles, roaming and tuning remain useful; remove only with evidence and appropriate migration.
+5. Retain only QE4-relevant roaming, network profiles and tuning; preserve configuration migration where needed.
 6. Define the precise local watchdog signals and recovery thresholds.
 7. Validate practical Wi-Fi coverage with the installed enclosure and any external antenna modification; RF hardware modifications require physical verification.
 8. Power supply for the board is **not yet settled**. Do not assume the QE4 provides a suitable regulated 5 V output; confirm electrical specifications and isolation before connecting it.
