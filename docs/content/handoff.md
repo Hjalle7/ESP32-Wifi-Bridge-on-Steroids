@@ -1,10 +1,14 @@
 # Handoff
 
-## Deployment fork implementation status
+## Deployment fork planning status
 
-WT32-ETH01 is the first-choice hardware. The first implementation slice adds the default 4 MB build target and provisioning-only HTTP/OTA, removes NetBIOS/SNTP startup, and changes the physical GPIO gesture to non-destructive setup. Setup uses a persistent random AP credential shown only on local serial. OTA acceptance waits for 30 continuous seconds of local link readiness. See [wt32-deployment.md](wt32-deployment.md) for commissioning, migration and remaining work, and [implementation-design.md](implementation-design.md) for the full proposed architecture.
+Only WT32-ETH01/4 MB is supported. Use `pio run -e wt32-eth01-4mb` and `python scripts/check_flash_layout.py wt32-eth01-4mb 4`; never use the retained legacy 8 MB/C5 builds for deployment. [wt32-deployment.md](wt32-deployment.md) records the initial implementation: 4 MB dual-slot layout, IO14 non-destructive provisioning, unique AP secret and no normal-mode HTTP/OTA/NetBIOS/SNTP; outbound IPv4/MQTT remains. Gateway-dependent watchdog/profile selection, synchronous MQTT and incomplete route authentication remain at this head; stacked PR #4 addresses them. Independent DNS, transactional validation, address-conflict safeguards, security decisions and hardware acceptance remain outstanding. Confirm flash ID, power and antenna physically. Not hardware-tested.
 
-No device tests have been performed. Watchdog/profile gateway ping, MQTT isolation, full provisioning API authentication and configuration validation still need implementation. The upstream snapshot below describes the prior deployed firmware and must not be read as validation of this fork's changes.
+## Historical upstream snapshot (not deployment instructions)
+
+Everything below describes upstream camera deployments and unsupported hardware. It is not QE4 acceptance evidence or an instruction to build, flash or test those targets.
+
+Technical state for whoever (human or Claude) picks up the next coding session. This file reflects the *current* state only — overwrite it each time; it is not a log (that's `history.md`) and not project-level context (that's `handover.md`).
 
 ## State as of 2026-09-05
 

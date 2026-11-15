@@ -1,8 +1,11 @@
-> Deployment fork: the default build is now `wt32-eth01-4mb` (4 MB WT32,
-> two 1920 KB OTA slots). The original `wt32-eth01` environment remains 8 MB.
-> Read [the deployment guide](docs/content/wt32-deployment.md) before flashing:
-> HTTP/OTA is provisioning-only and the physical setup input preserves settings.
-> Firmware runtime changes require hardware verification before unattended use.
+> QE4 fork: **WT32-ETH01/4 MB is the only supported target**. Build only
+> `pio run -e wt32-eth01-4mb`; verify with
+> `python scripts/check_flash_layout.py wt32-eth01-4mb 4` before flashing.
+> Read [the deployment guide](docs/content/wt32-deployment.md): HTTP/OTA is
+> provisioning-only and physical setup entry preserves settings. Not hardware-tested.
+> The retained C5/W5500 and 8 MB environments are unsupported legacy code.
+> The upstream README below is historical context; its hardware, build, tuning
+> and management instructions do not override [AGENTS.md](AGENTS.md) or this guide.
 
 # ESP32 Wi-Fi Bridge on Steroids
 

@@ -2,35 +2,17 @@
 
 Status: target design with an initial implementation slice; see [wt32-deployment.md](wt32-deployment.md) for implemented behavior and remaining work. Hardware validation has not been performed.
 
-This fork targets a transparent bridge for an Ethernet heat pump, with a static IPv4 telemetry endpoint and administration available only through an explicit provisioning mode. Extend the existing firmware. WT32-ETH01 is the first-choice deployment hardware. Olimex ESP32-POE-ISO-EA-16MB remains a secondary candidate, conditional on the clock qualification below; it does not block WT32 development.
+This fork targets a transparent bridge for the Qvantum QE4 heat pump, with a static IPv4 telemetry endpoint and administration available only through explicit provisioning. Extend the existing ESP-IDF/PlatformIO firmware. [AGENTS.md](../../AGENTS.md) is the source of current requirements.
 
-## Hardware mapping and first qualification gate
+## Supported hardware and first qualification gate
 
-| Property | Olimex ESP32-POE-ISO-EA-16MB | Existing WT32-ETH01 target |
-| --- | --- | --- |
-| SoC/module family | Original ESP32, WROOM variant, external antenna | Original ESP32 with LAN8720A |
-| Flash | Manufacturer specifies 16 MB; verify actual board | 8 MB on upstream reference board; verify purchased unit |
-| Ethernet interface | Internal EMAC, RMII | Internal EMAC, RMII |
-| PHY | LAN8710A shown in Rev.N schematic; LAN87xx driver candidate | Existing LAN87xx driver |
-| PHY address | 0 in Olimex examples | 1 in current code |
-| MDC / MDIO | GPIO23 / GPIO18 | GPIO23 / GPIO18 |
-| PHY power enable | GPIO12, high in manufacturer example | GPIO16, high in current code |
-| RMII reference clock | ESP32 output on GPIO17, inverted 50 MHz | External input on GPIO0 |
-| Provisioning input candidate | BUT1 on GPIO34, active low | Dedicated input on GPIO14, currently factory reset |
+Only WT32-ETH01 with classic ESP32, LAN8720 Ethernet and 2.4 GHz Wi-Fi using a 4 MB flash configuration is supported. Olimex, ESP32-C5/W5500 and 8 MB variants are outside this project's implementation and validation scope. Retained legacy configurations/code are not supported product targets; delete them only after checking WT32/shared-code dependencies.
 
-Olimex's sample configuration calls the PHY LAN8720, while its Rev.N schematic identifies LAN8710A. Use the LAN87xx driver only after confirming the actual PHY identity and address on the purchased revision. The WROOM 16 MB variant must not be confused with WROVER/PSRAM variants, which have different pin constraints. GPIO34 is input-only and has no internal pull-up: confirm the board's external bias from the actual schematic and idle voltage; do not copy the current pull-up-based reset helper unchanged.
+WT32 wiring in the existing implementation: PHY address 1, MDC GPIO23, MDIO GPIO18, PHY power GPIO16 and external RMII clock input GPIO0. GPIO14 is the proposed provisioning input; qualify the actual board wiring before use. Do not change the shared forwarding path to add another board.
 
-**Qualification gate for Olimex only: simultaneous Wi-Fi and Ethernet clocking.** Espressif's ESP-IDF v5.5 Ethernet guide explicitly advises against sourcing REF_CLK from ESP32 when Wi-Fi is active, due to clock instability. Olimex's normal WROOM wiring uses that clock source on GPIO17. Manufacturer Ethernet examples alone do not prove reliable simultaneous STA bridging. Before accepting this board, test the exact board revision and pinned toolchain with Ethernet and Wi-Fi active, including cold boots, reconnects, sustained bidirectional traffic and an unattended soak. A passing limited test is evidence, not a guarantee against the documented limitation. If unreliable, prefer WT32 with its external clock, or evaluate an external-clock hardware modification against the schematic; no GPIO-only software setting can create an unwired clock source.
+Before flashing, read the purchased unit with `esptool flash-id`. Do not infer its capacity from an upstream reference board. The retained `wt32-eth01` environment assumes 8 MB and must not be used for this deployment. This slice adds `wt32-eth01-4mb`; use only that environment and verify matching PlatformIO flash settings, effective sdkconfig, application/bootloader headers and the 4 MB partition/OTA budget. Initial installation and partition changes require a cable; app-only OTA cannot migrate the partition table.
 
-Power: the Olimex board supports isolated IEEE 802.3af PoE input and other supply options. The Ethernet port connects to the heat pump, so do not assume PoE is available from the pump. Select USB or another manufacturer-supported supply unless the actual topology provides a PoE PSE. The board is not a PoE power source for the pump. Validate power stability and temperature in the intended enclosure. The product's commercial temperature rating is 0–70 C; verify the enclosure conditions.
-
-## Board support design
-
-Use the existing `wt32-eth01` PlatformIO environment on the pinned platform as the primary implementation and validation target. Verify the actual board revision, flash capacity and antenna arrangement before deployment; the upstream reference board has 8 MB, which must not be assumed for every WT32 unit. Retain C5 support without making it the deployment candidate. Defer a dedicated `olimex-esp32-poe-iso-ea-16mb` environment until that secondary candidate is revisited.
-
-When adding Olimex support, move board-specific PHY address, power GPIO, RMII clock mode/pin and provisioning input into explicit compile-time board profiles. Keep the shared raw-frame forwarding code unchanged in the first hardware patch. The Olimex profile needs ESP-IDF internal RMII clock output with inverted GPIO17 output, rather than the hard-coded external GPIO0 input in `bridge_eth_init()`. Verify the exact API enum against the pinned SDK at implementation time. Do not merely change PHY power and address.
-
-For the optional Olimex target only, set both `board_build.flash_size` and `board_upload.flash_size` to 16MB, and validate generated image headers plus the physical flash ID. Start with a separately named 16 MB partition table preserving the existing offsets and two 3 MB OTA slots, 24 KB NVS and 64 KB coredump, leaving the remaining capacity unallocated. Extra flash does not require larger application slots. Check NVS capacity for the expanded configuration. First deployment uses a cable because partition tables cannot be changed through ordinary app OTA. Do not carry a 16 MB image header onto a smaller WT32.
+Power is unresolved: verify board input specifications, regulation and isolation before connecting a supply. Do not assume the QE4 provides regulated 5 V or PoE. Antenna/enclosure modifications require physical RF and link-stability validation.
 
 ## Runtime states
 
@@ -77,22 +59,23 @@ Proposed update policy: authenticated OTA in provisioning only, with USB recover
 
 ## Small implementation patches and acceptance
 
-1. Establish the WT32 baseline using its existing build environment. Verify the actual board revision, flash capacity and partition compatibility, antenna solution, power, simultaneous Ethernet/Wi-Fi and DHCP/ARP before changing runtime behavior. Olimex board profiles and its clock qualification are deferred and are not prerequisites for WT32 work.
+1. Establish and validate the WT32 4 MB build, partition layout and OTA/rollback budget before flashing. Verify the actual board flash ID, antenna, power, simultaneous Ethernet/Wi-Fi and DHCP/ARP. Do not build or test unsupported targets.
 2. Explicit runtime states and button-driven provisioning without reset. Verify saved settings survive entry, timeout and reboot. Validate unique AP secret and separate factory reset.
 3. Remove normal-mode HTTP, NetBIOS and SNTP startup. Verify no listening management ports and capture only required telemetry-stack traffic. Verify DHCP/ARP and client Modbus reads/writes continue.
 4. Local watchdog and explicit profile selection. Inject Wi-Fi outage, cable removal, local queue failure and prolonged quiet traffic. Confirm bounded recovery and no broker-dependent resets.
 5. DNS/IP persistence and isolated MQTT worker. Test old NVS blobs, rejected settings, interrupted saves, broker outage/backpressure, discovery ACLs and recovery.
 6. Provisioning OTA/rollback and soak. Test client replacement/MAC relearning after link-up, cold boots, double-direction traffic, reconnection, update failure and representative long-term Modbus use.
 
-Build success does not demonstrate hardware compatibility or transparent forwarding. No throughput tuning is proposed; use load only to qualify clock, power and reliability. Keep WT32 usable throughout. C5 changes require its build check as well.
+Build success does not demonstrate hardware compatibility or transparent forwarding. No throughput tuning is proposed; use load only to qualify clock, power and reliability. Keep WT32-ETH01/4 MB usable throughout; no all-environments build is required.
 
-## Sources and evidence
+## Status and outstanding requirements
 
-Manufacturer sources consulted for this mapping (check the purchased PCB revision):
+PR #2 provides the design. This PR #3 slice adds the 4 MB target, non-destructive provisioning entry, unique AP credentials and provisioning-only management/OTA. PR #4 builds on it for local recovery, isolated MQTT and setup authentication; those changes are not present at this head or main. See the deployment guide for implementation limits; design sections above describe the target, not completion.
 
-- [Olimex product and variant specifications](https://www.olimex.com/Products/IoT/ESP32/ESP32-POE-ISO/open-source-hardware)
-- [Olimex Rev.N schematic](https://github.com/OLIMEX/ESP32-POE-ISO/blob/c19307ecd8a9d8c5703de7a1571cd89945e39c01/HARDWARE/ESP32-PoE-ISO-Rev.N/ESP32-PoE-ISO_Rev_N.pdf)
-- [Olimex WROOM 16 MB ISO example and GPIO mapping](https://github.com/OLIMEX/ESP32-POE/blob/deb38a377d50eadb04ddc7118a17a5ae58b1ee53/SOFTWARE/ESPHOME/esp32-poe-iso-16mb.yaml) (mapping reference, not a firmware dependency or simultaneous bridge test)
-- [ESP-IDF v5.5 Ethernet guide: RMII clock and Wi-Fi restriction](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-reference/network/esp_eth.html)
+Before deployment, complete independent DNS provisioning, transactional configuration validation (netmask/routing, usable addresses, MQTT port and string limits), known-client collision checks and DHCP exclusion guidance. Decide maximum setup-session duration, update/rollback acceptance and credential-storage/TLS/broker-ACL tradeoffs explicitly. Secure boot and flash encryption are not claimed enabled. Qualify QE4-relevant profiles/tuning and local driver/queue/task fault detection without treating intentional rate limiting or idle traffic as faults.
 
-Repository code inspected: `src/bridge.cpp`, `src/main.cpp`, `src/config.h`, `src/config.cpp`, `src/web.cpp`, `src/telemetry.cpp`, `src/crashlog.cpp`, `platformio.ini`, and `sdkconfig.defaults`. Requirements come from the user's Second Brain 2 project overview and project summary; this document makes the plan available in the repository without relying on Dropbox access.
+Hardware acceptance must cover cold boot, MAC cloning, shared-MAC IPv4/ARP reply demultiplexing, DHCP/DNS/broadcast forwarding, bidirectional Modbus TCP, idle client, broker outage/reconnect, Wi-Fi/cable recovery, provisioning without reset, old NVS blobs, OTA/rollback, power/antenna stability and soak. Builds alone do not establish readiness. Not hardware-tested.
+
+## Source of truth
+
+Requirements: [AGENTS.md](../../AGENTS.md). Implementation: `platformio.ini`, sdkconfig and partition files, `src/bridge.cpp`, `src/main.cpp`, `src/config.*`, `src/web.cpp` and `src/telemetry.cpp`. Historical upstream hardware notes do not expand the supported target scope.

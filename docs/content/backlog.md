@@ -2,7 +2,11 @@
 
 ## Deployment fork plan
 
-See [implementation-design.md](implementation-design.md) for the proposed heat-pump bridge architecture and acceptance gates. WT32-ETH01 is the first-choice hardware. Olimex ESP32-POE-ISO-EA-16MB is a secondary candidate, conditional on simultaneous Wi-Fi/RMII-clock qualification if revisited. The first implementation slice adds a 4 MB target, non-destructive setup, unique AP credentials and provisioning-only HTTP, and removes normal-mode NetBIOS/SNTP startup. See [wt32-deployment.md](wt32-deployment.md). Verify actual board/flash/antenna/power configuration when hardware is available. Next replace ping-based recovery/profile selection, isolate MQTT, and finish provisioning authentication/config validation. Existing upstream items below remain historical/current upstream context.
+Only WT32-ETH01/4 MB is supported; use current [AGENTS.md](../../AGENTS.md) and [wt32-deployment.md](wt32-deployment.md). This slice implements the 4 MB target and provisioning-only management. Stacked PR #4 handles local watchdog/profile selection, nonblocking MQTT and all-route authentication; do not duplicate that work. Remaining deployment requirements: independent DNS, transactional input validation/NVS migration and failed-save handling, IP-conflict/DHCP safeguards, setup duration and security policy decisions, confirmed flash/power/antenna, and hardware acceptance for shared-MAC IPv4/ARP, DHCP/Modbus, outages, provisioning and OTA rollback. No target hardware tests have been performed.
+
+## Historical upstream backlog (outside QE4 scope)
+
+The items below are retained context, not current product requirements or instructions to build/test C5/W5500 or 8 MB targets.
 
 Open tasks and known issues, current priority first. Mutable — edit freely, remove items once done (the permanent record of *that they were done* belongs in `history.md`).
 
