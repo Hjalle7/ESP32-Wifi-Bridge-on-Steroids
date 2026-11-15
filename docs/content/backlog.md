@@ -2,7 +2,11 @@
 
 ## Deployment fork plan
 
-See [implementation-design.md](implementation-design.md) for the proposed heat-pump bridge architecture and acceptance gates. WT32-ETH01 is the first-choice hardware. Olimex ESP32-POE-ISO-EA-16MB is a secondary candidate, conditional on simultaneous Wi-Fi/RMII-clock qualification if revisited. Implementation has not started. First verify the existing WT32 build and actual board/flash/antenna/power configuration, then separate provisioning, remove normal-mode management services, replace ping-based recovery/profile selection, and isolate MQTT. Existing upstream items below remain historical/current upstream context.
+See [implementation-design.md](implementation-design.md) and current [AGENTS.md](../../AGENTS.md). Only WT32-ETH01/4 MB is supported. Establish the 4 MB environment/partitions before flashing, then implement provisioning-only management, local recovery and isolated outbound MQTT in stacked PRs #3/#4. Verify flash ID, power and antenna physically. Independent DNS, transactional validation/address-conflict safeguards, setup timeout policy, security tradeoffs and the full QE4 hardware acceptance matrix remain outstanding; planned work is not implemented by this documentation PR.
+
+## Historical upstream backlog (outside QE4 scope)
+
+The items below are retained context, not current product requirements or instructions to build/test C5/W5500 or 8 MB targets.
 
 Open tasks and known issues, current priority first. Mutable — edit freely, remove items once done (the permanent record of *that they were done* belongs in `history.md`).
 
