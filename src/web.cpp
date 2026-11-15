@@ -1555,7 +1555,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
 /* POST /api/config - parse the form-urlencoded body, validate and clamp
  * every field, save to NVS and apply the live tuning values. Fields missing
  * from the body stay unchanged; empty password fields mean "unchanged".
- * Unauthenticated (see CLAUDE.md). Counts as portal activity. */
+ * Unauthenticated (see AGENTS.md). Counts as portal activity. */
 static esp_err_t h_config_post(httpd_req_t *r) {
   s_last_activity_ms = millis();
   /* More generous than needed, but not unlimited: the form always sends ALL
