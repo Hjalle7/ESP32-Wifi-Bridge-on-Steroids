@@ -9,7 +9,7 @@ The following requirements describe the agreed target, not features already impl
 
 ### Deployment hardware and detailed design
 
-- Preferred candidate: Olimex ESP32-POE-ISO-EA-16MB. Second choice: WT32-ETH01. Keep existing C5 support, but it is not the deployment preference.
+- First choice: WT32-ETH01. Olimex ESP32-POE-ISO-EA-16MB is a secondary candidate, conditional on clock/Wi-Fi qualification. Keep existing C5 support, but it is not the deployment preference.
 - Read [implementation-design.md](docs/content/implementation-design.md) before implementation. It documents board mapping, the blocking Olimex RMII clock/Wi-Fi qualification, proposed runtime states, persistence, watchdog and validation.
 - Olimex support is not implemented or hardware-verified. Do not reuse the WT32 PHY address, power GPIO or clock mode unchanged.
 

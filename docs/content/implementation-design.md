@@ -2,7 +2,7 @@
 
 Status: proposed design; no firmware changes or hardware validation performed.
 
-This fork targets a transparent bridge for an Ethernet heat pump, with a static IPv4 telemetry endpoint and administration available only through an explicit provisioning mode. Extend the existing firmware. Olimex ESP32-POE-ISO-EA-16MB is the preferred candidate; WT32-ETH01 is the fallback. Hardware selection is conditional on the clock qualification below.
+This fork targets a transparent bridge for an Ethernet heat pump, with a static IPv4 telemetry endpoint and administration available only through an explicit provisioning mode. Extend the existing firmware. WT32-ETH01 is the first-choice deployment hardware. Olimex ESP32-POE-ISO-EA-16MB remains a secondary candidate, conditional on the clock qualification below; it does not block WT32 development.
 
 ## Hardware mapping and first qualification gate
 
@@ -20,17 +20,17 @@ This fork targets a transparent bridge for an Ethernet heat pump, with a static 
 
 Olimex's sample configuration calls the PHY LAN8720, while its Rev.N schematic identifies LAN8710A. Use the LAN87xx driver only after confirming the actual PHY identity and address on the purchased revision. The WROOM 16 MB variant must not be confused with WROVER/PSRAM variants, which have different pin constraints. GPIO34 is input-only and has no internal pull-up: confirm the board's external bias from the actual schematic and idle voltage; do not copy the current pull-up-based reset helper unchanged.
 
-**Blocking hardware qualification: simultaneous Wi-Fi and Ethernet clocking.** Espressif's ESP-IDF v5.5 Ethernet guide explicitly advises against sourcing REF_CLK from ESP32 when Wi-Fi is active, due to clock instability. Olimex's normal WROOM wiring uses that clock source on GPIO17. Manufacturer Ethernet examples alone do not prove reliable simultaneous STA bridging. Before accepting this board, test the exact board revision and pinned toolchain with Ethernet and Wi-Fi active, including cold boots, reconnects, sustained bidirectional traffic and an unattended soak. A passing limited test is evidence, not a guarantee against the documented limitation. If unreliable, prefer WT32 with its external clock, or evaluate an external-clock hardware modification against the schematic; no GPIO-only software setting can create an unwired clock source.
+**Qualification gate for Olimex only: simultaneous Wi-Fi and Ethernet clocking.** Espressif's ESP-IDF v5.5 Ethernet guide explicitly advises against sourcing REF_CLK from ESP32 when Wi-Fi is active, due to clock instability. Olimex's normal WROOM wiring uses that clock source on GPIO17. Manufacturer Ethernet examples alone do not prove reliable simultaneous STA bridging. Before accepting this board, test the exact board revision and pinned toolchain with Ethernet and Wi-Fi active, including cold boots, reconnects, sustained bidirectional traffic and an unattended soak. A passing limited test is evidence, not a guarantee against the documented limitation. If unreliable, prefer WT32 with its external clock, or evaluate an external-clock hardware modification against the schematic; no GPIO-only software setting can create an unwired clock source.
 
 Power: the Olimex board supports isolated IEEE 802.3af PoE input and other supply options. The Ethernet port connects to the heat pump, so do not assume PoE is available from the pump. Select USB or another manufacturer-supported supply unless the actual topology provides a PoE PSE. The board is not a PoE power source for the pump. Validate power stability and temperature in the intended enclosure. The product's commercial temperature rating is 0–70 C; verify the enclosure conditions.
 
 ## Board support design
 
-Add a dedicated `olimex-esp32-poe-iso-ea-16mb` PlatformIO environment on the existing pinned platform. Keep `wt32-eth01` unchanged as the fallback; retain C5 support without making it the deployment candidate.
+Use the existing `wt32-eth01` PlatformIO environment on the pinned platform as the primary implementation and validation target. Verify the actual board revision, flash capacity and antenna arrangement before deployment; the upstream reference board has 8 MB, which must not be assumed for every WT32 unit. Retain C5 support without making it the deployment candidate. Defer a dedicated `olimex-esp32-poe-iso-ea-16mb` environment until that secondary candidate is revisited.
 
-Move board-specific PHY address, power GPIO, RMII clock mode/pin and provisioning input into explicit compile-time board profiles. Keep the shared raw-frame forwarding code unchanged in the first hardware patch. The Olimex profile needs ESP-IDF internal RMII clock output with inverted GPIO17 output, rather than the hard-coded external GPIO0 input in `bridge_eth_init()`. Verify the exact API enum against the pinned SDK at implementation time. Do not merely change PHY power and address.
+When adding Olimex support, move board-specific PHY address, power GPIO, RMII clock mode/pin and provisioning input into explicit compile-time board profiles. Keep the shared raw-frame forwarding code unchanged in the first hardware patch. The Olimex profile needs ESP-IDF internal RMII clock output with inverted GPIO17 output, rather than the hard-coded external GPIO0 input in `bridge_eth_init()`. Verify the exact API enum against the pinned SDK at implementation time. Do not merely change PHY power and address.
 
-Set both `board_build.flash_size` and `board_upload.flash_size` to 16MB, and validate generated image headers plus the physical flash ID. Start with a separately named 16 MB partition table preserving the existing offsets and two 3 MB OTA slots, 24 KB NVS and 64 KB coredump, leaving the remaining capacity unallocated. Extra flash does not require larger application slots. Check NVS capacity for the expanded configuration. First deployment uses a cable because partition tables cannot be changed through ordinary app OTA. Do not carry a 16 MB image header onto a smaller WT32.
+For the optional Olimex target only, set both `board_build.flash_size` and `board_upload.flash_size` to 16MB, and validate generated image headers plus the physical flash ID. Start with a separately named 16 MB partition table preserving the existing offsets and two 3 MB OTA slots, 24 KB NVS and 64 KB coredump, leaving the remaining capacity unallocated. Extra flash does not require larger application slots. Check NVS capacity for the expanded configuration. First deployment uses a cable because partition tables cannot be changed through ordinary app OTA. Do not carry a 16 MB image header onto a smaller WT32.
 
 ## Runtime states
 
@@ -77,7 +77,7 @@ Proposed update policy: authenticated OTA in provisioning only, with USB recover
 
 ## Small implementation patches and acceptance
 
-1. Board profiles and Olimex build environment only. Build Olimex and WT32; qualify flash, PHY, clock, Ethernet+Wi-Fi, DHCP and power on the actual board. Stop hardware adoption if clock reliability is unresolved.
+1. Establish the WT32 baseline using its existing build environment. Verify the actual board revision, flash capacity and partition compatibility, antenna solution, power, simultaneous Ethernet/Wi-Fi and DHCP/ARP before changing runtime behavior. Olimex board profiles and its clock qualification are deferred and are not prerequisites for WT32 work.
 2. Explicit runtime states and button-driven provisioning without reset. Verify saved settings survive entry, timeout and reboot. Validate unique AP secret and separate factory reset.
 3. Remove normal-mode HTTP, NetBIOS and SNTP startup. Verify no listening management ports and capture only required telemetry-stack traffic. Verify DHCP/ARP and client Modbus reads/writes continue.
 4. Local watchdog and explicit profile selection. Inject Wi-Fi outage, cable removal, local queue failure and prolonged quiet traffic. Confirm bounded recovery and no broker-dependent resets.

@@ -2,7 +2,7 @@
 
 ## Deployment fork plan
 
-See [implementation-design.md](implementation-design.md) for the proposed heat-pump bridge architecture and acceptance gates. Olimex ESP32-POE-ISO-EA-16MB is the preferred hardware candidate, conditional on simultaneous Wi-Fi/RMII-clock qualification; WT32-ETH01 is second choice. Implementation has not started. First qualify the board profile, then separate provisioning, remove normal-mode management services, replace ping-based recovery/profile selection, and isolate MQTT. Existing upstream items below remain historical/current upstream context.
+See [implementation-design.md](implementation-design.md) for the proposed heat-pump bridge architecture and acceptance gates. WT32-ETH01 is the first-choice hardware. Olimex ESP32-POE-ISO-EA-16MB is a secondary candidate, conditional on simultaneous Wi-Fi/RMII-clock qualification if revisited. Implementation has not started. First verify the existing WT32 build and actual board/flash/antenna/power configuration, then separate provisioning, remove normal-mode management services, replace ping-based recovery/profile selection, and isolate MQTT. Existing upstream items below remain historical/current upstream context.
 
 Open tasks and known issues, current priority first. Mutable — edit freely, remove items once done (the permanent record of *that they were done* belongs in `history.md`).
 
