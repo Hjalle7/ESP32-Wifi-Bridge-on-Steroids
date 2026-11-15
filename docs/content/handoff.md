@@ -1,5 +1,9 @@
 # Handoff
 
+## Deployment fork planning status
+
+The heat-pump deployment design is documented in [implementation-design.md](implementation-design.md). Preferred hardware is Olimex ESP32-POE-ISO-EA-16MB, with WT32-ETH01 as fallback. The Olimex internal RMII clock and concurrent Wi-Fi require qualification before committing to this board. This is a documentation-only plan; no firmware changes, new-target builds or device tests have been performed. The upstream deployment snapshot below describes existing firmware, not completed work on this plan.
+
 Technical state for whoever (human or Claude) picks up the next coding session. This file reflects the *current* state only — overwrite it each time; it is not a log (that's `history.md`) and not project-level context (that's `handover.md`).
 
 ## State as of 2026-09-05

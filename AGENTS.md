@@ -7,6 +7,12 @@ Instructions for AI assistants and contributors working in this repository. Read
 
 The following requirements describe the agreed target, not features already implemented. The architecture sections below document the current firmware; where they differ, use this section to guide new work. Extend the existing implementation rather than rewriting it.
 
+### Deployment hardware and detailed design
+
+- Preferred candidate: Olimex ESP32-POE-ISO-EA-16MB. Second choice: WT32-ETH01. Keep existing C5 support, but it is not the deployment preference.
+- Read [implementation-design.md](docs/content/implementation-design.md) before implementation. It documents board mapping, the blocking Olimex RMII clock/Wi-Fi qualification, proposed runtime states, persistence, watchdog and validation.
+- Olimex support is not implemented or hardware-verified. Do not reuse the WT32 PHY address, power GPIO or clock mode unchanged.
+
 ### Normal bridge operation
 
 - Preserve transparent Ethernet–Wi-Fi layer-2 bridging and client MAC cloning. The Ethernet client remains in the existing IoT VLAN and IP subnet, with DHCP supplied by the existing router. Do not introduce NAT, a separate subnet, or a WDS requirement.
