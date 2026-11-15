@@ -9,9 +9,8 @@
  * Runs as APSTA so the portal can scan for networks. */
 bool portal_start_ap(void);
 
-/* Start the HTTP server. Works in both modes - in AP mode on 192.168.4.1, in
- * bridge mode on the management IP. `provisioning` only changes what the
- * status API reports and whether saved tuning is applied live. */
+/* Start HTTP only for provisioning. A false argument is rejected; bridge
+ * mode keeps its static IP for MQTT without starting a management server. */
 bool web_start(bool provisioning);
 
 /* millis() timestamp of the last REAL portal use (page loaded, configuration

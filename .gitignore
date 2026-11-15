@@ -3,8 +3,9 @@
 
 # Generated, fully resolved sdkconfig cache.
 # Produced from sdkconfig.defaults; committing it causes exactly the drift
-# that is described in CLAUDE.md ("sdkconfig drift").
+# that is described in AGENTS.md ("sdkconfig drift").
 sdkconfig.wt32-eth01
+sdkconfig.wt32-eth01-4mb
 sdkconfig.wt32-eth01-minimal
 sdkconfig.nicemcu-c5-w5500
 sdkconfig.*.old

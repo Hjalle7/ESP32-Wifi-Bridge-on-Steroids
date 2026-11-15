@@ -31,13 +31,19 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
+#include "esp_random.h"
+#include "esp_rom_sys.h"
+#include "bootloader_random.h"
+#include "nvs.h"
 #include "esp_core_dump.h"
 #include "build_info.h"
 #include "crashlog.h"
 #include "conlog.h"
 #include "cpustat.h"
 
-#define AP_PASSWORD   "bridgesetup"   /* at least 8 characters, otherwise open */
+/* Separate from the configuration blob so ordinary edits preserve the AP
+ * credential without changing the append-only BridgeConfig layout. */
+static char s_ap_password[33] = {};
 
 static httpd_handle_t s_httpd = NULL;
 static bool           s_provisioning = false;
@@ -49,9 +55,40 @@ uint32_t web_last_activity_ms(void) { return s_last_activity_ms; }
  * Access point
  * ========================================================================= */
 
-/* Start the setup access point "<name>-setup-XXXX" (WPA2, AP_PASSWORD) in
+/* Load the device-local setup secret or generate and persist 128 random
+ * bits before Wi-Fi initializes. The temporary hardware entropy source must
+ * be disabled before the radio starts. Never fall back to a shared secret. */
+static bool load_ap_password(void) {
+  nvs_handle_t h;
+  if (nvs_open("provisioning", NVS_READWRITE, &h) != ESP_OK) return false;
+  size_t size = sizeof(s_ap_password);
+  esp_err_t err = nvs_get_str(h, "ap_secret", s_ap_password, &size);
+  if (err == ESP_ERR_NVS_NOT_FOUND) {
+    uint8_t random[16];
+    bootloader_random_enable();
+    esp_fill_random(random, sizeof(random));
+    bootloader_random_disable();
+    const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(random); ++i) {
+      s_ap_password[2 * i] = hex[random[i] >> 4];
+      s_ap_password[2 * i + 1] = hex[random[i] & 15];
+    }
+    s_ap_password[32] = '\0';
+    err = nvs_set_str(h, "ap_secret", s_ap_password);
+    if (err == ESP_OK) err = nvs_commit(h);
+  }
+  nvs_close(h);
+  return err == ESP_OK && size <= sizeof(s_ap_password) &&
+         strlen(s_ap_password) == 32;
+}
+
+/* Start the setup access point "<name>-setup-XXXX" (WPA2, device-local secret) in
  * APSTA mode, so the portal can also scan for networks. See web.h. */
 bool portal_start_ap(void) {
+  if (!load_ap_password()) {
+    printf("[PORT] Cannot load or persist the setup credential\n");
+    return false;
+  }
   /* Keep this idempotent. esp_netif_create_default_wifi_*() does not answer
    * an if_key that is already taken with an error code but with an assert -
    * i.e. a crash. The portal is the lifeline of a device without serial
@@ -84,13 +121,15 @@ bool portal_start_ap(void) {
   ap.ap.channel        = 1;
   ap.ap.max_connection = 2;
   ap.ap.authmode       = WIFI_AUTH_WPA2_PSK;
-  strcpy((char *)ap.ap.password, AP_PASSWORD);
+  strcpy((char *)ap.ap.password, s_ap_password);
 
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap));
   ESP_ERROR_CHECK(esp_wifi_start());
 
-  printf("\n[PORT] Setup Wi-Fi: '%s'  password: '%s'\n",
-                (char *)ap.ap.ssid, AP_PASSWORD);
+  printf("\n[PORT] Setup Wi-Fi: '%s'\n", (char *)ap.ap.ssid);
+  /* Bypass the web-visible console ring. Obtain this secret locally before
+   * deployment; do not expose it through /api/log or MQTT. */
+  esp_rom_printf("[PORT] Local setup password: %s\n", s_ap_password);
   printf("[PORT] Then open http://192.168.4.1\n\n");
   return true;
 }
@@ -2388,7 +2427,13 @@ static esp_err_t h_panic_test(httpd_req_t *r) {
 
 /* Start the HTTP server and register all routes (see web.h). */
 bool web_start(bool provisioning) {
-  s_provisioning = provisioning;
+  /* Refuse accidental normal-mode startup even if a future caller forgets
+   * the lifecycle policy. The static STA IP exists only for telemetry. */
+  if (!provisioning) {
+    printf("[WEB ] Refusing HTTP outside provisioning mode\n");
+    return false;
+  }
+  s_provisioning = true;
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;

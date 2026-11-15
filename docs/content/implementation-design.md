@@ -1,6 +1,6 @@
 # Heat-pump bridge implementation design
 
-Status: proposed design; no firmware changes or hardware validation performed.
+Status: target design with an initial implementation slice; see [wt32-deployment.md](wt32-deployment.md) for implemented behavior and remaining work. Hardware validation has not been performed.
 
 This fork targets a transparent bridge for an Ethernet heat pump, with a static IPv4 telemetry endpoint and administration available only through an explicit provisioning mode. Extend the existing firmware. WT32-ETH01 is the first-choice deployment hardware. Olimex ESP32-POE-ISO-EA-16MB remains a secondary candidate, conditional on the clock qualification below; it does not block WT32 development.
 

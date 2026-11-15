@@ -1,0 +1,3 @@
+# Match the physical flash and image header of the 4 MB WT32 target.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"

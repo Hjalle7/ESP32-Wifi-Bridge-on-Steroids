@@ -56,7 +56,7 @@ Use a separate branch for changes; leave main unchanged until review and merge. 
 
 ## What this is
 
-An ESP32 firmware that turns a WT32-ETH01 board (ESP32-D0WD + LAN8720A PHY) into a transparent Wi-Fi↔Ethernet L2 bridge with MAC cloning: a device plugged into the Ethernet port (e.g. an IP camera) gets bridged onto a Wi-Fi network as if it were directly connected, while a separate static management IP on the same interface serves a config portal, a status API, and MQTT telemetry.
+An ESP32 firmware that turns a WT32-ETH01 board (ESP32-D0WD + LAN8720A PHY) into a transparent Wi-Fi↔Ethernet L2 bridge with MAC cloning: a device plugged into the Ethernet port (e.g. an IP camera) gets bridged onto a Wi-Fi network as if it were directly connected, while a separate static IPv4 on the same interface supports outgoing MQTT telemetry. The config portal and status API run only in provisioning mode.
 
 Pure ESP-IDF via PlatformIO (`framework = espidf`) — no Arduino. The project used to be a dual `arduino, espidf` build; Arduino was removed deliberately because it transitively pulled in the ESP RainMaker/Insights components through the IDF Component Manager (unused, cost flash, caused recurring `esp_crt_bundle.h` / certificate build failures). `compat.h` provides just `millis()`/`delay()` over `esp_timer`/`vTaskDelay` so the original Arduino-style code didn't need a full rewrite.
 
@@ -65,9 +65,9 @@ Pure ESP-IDF via PlatformIO (`framework = espidf`) — no Arduino. The project u
 **On the original development machine, use `~/.pio-py313/bin/pio`, not plain `pio`.** See "Toolchain" below. On other machines, use an available compatible PlatformIO environment; do not assume this local path exists.
 
 ```bash
-~/.pio-py313/bin/pio run -e wt32-eth01                 # build
-~/.pio-py313/bin/pio run -e wt32-eth01 -t upload       # flash
-~/.pio-py313/bin/pio run -e wt32-eth01 -t monitor      # serial monitor (115200, esp32_exception_decoder)
+~/.pio-py313/bin/pio run -e wt32-eth01-4mb             # build
+~/.pio-py313/bin/pio run -e wt32-eth01-4mb -t upload       # flash
+~/.pio-py313/bin/pio run -e wt32-eth01-4mb -t monitor      # serial monitor (115200, esp32_exception_decoder)
 ~/.pio-py313/bin/pio run -t clean                      # clean build artifacts
 ```
 
@@ -79,14 +79,15 @@ The pioarduino `platform-espressif32` rejects Python ≥ 3.14 outright in its `p
 
 Moving `~/.platformio/platforms/espressif32` out of the way does *not* work as a dodge: PlatformIO re-downloads it from the URL in `platformio.ini`, and the current release carries the same check.
 
-There are two environments, built from the same sources; no separate test suite (this is embedded firmware — verification is build success + on-device serial log behavior):
+There are three environments, built from the same sources; no separate test suite (this is embedded firmware — verification is build success + on-device serial log behavior):
 
+- `wt32-eth01-4mb` — default deployment target, 4 MB WT32, two 1920 KB OTA slots. Verify actual flash capacity before first cable installation.
 - `wt32-eth01` — ESP32 + internal EMAC + LAN8720A (the original target, 8 MB flash).
 - `nicemcu-c5-w5500` — NiceMCU ESP32-C5_MINI_V1.0 (ESP32-C5HF4: single-core RISC-V, dual-band Wi-Fi 6, 4 MB in-package flash, no PSRAM, native USB) + a W5500 over SPI. See "Second target" below. Flash and monitor over the board's USB-C port (`/dev/cu.usbmodem*`).
 
 ### Flash budget
 
-The board has **8 MB** of flash — measured at the chip on 2026-08-13 (`esptool flash-id` → Zbit `0x5E`/`0x4017`, capacity byte `0x17` = 8 MiB, cross-checked with an aliasing read at `0x401000`). Earlier project notes claiming 2 MB were wrong, and `partitions_2mb_ota.csv` is the obsolete leftover from that belief; the live layout is `partitions_8mb_ota.csv` (2 × 3 MB OTA slots + a 64 KB coredump partition). Current usage is ~26% of a slot, so flash pressure is no longer a real constraint.
+The upstream reference board has **8 MB** of flash — measured at the chip on 2026-08-13 (`esptool flash-id` → Zbit `0x5E`/`0x4017`, capacity byte `0x17` = 8 MiB, cross-checked with an aliasing read at `0x401000`). Earlier project notes claiming 2 MB were wrong, and `partitions_2mb_ota.csv` is the obsolete leftover from that belief; the live layout is `partitions_8mb_ota.csv` (2 × 3 MB OTA slots + a 64 KB coredump partition). The initial deployment build is about 969 KB: 49.3% of a 1920 KB slot on the 4 MB target and 30.8% of a 3 MB slot on the 8 MB target. Measure again after changes rather than assuming this margin.
 
 Note the asymmetry if you ever change the size again: `esp_flash_init_default_chip()` **fails hard** when the detected chip is *smaller* than the image header claims, but only *warns* (and wastes capacity) when it's larger. Too-big headers brick the boot; too-small ones just cost space. After a build, check the `Flash:` percentage in the `pio run` output. If a change pushes it over 100%, the fix is almost never "trim comments" — check `CONFIG_COMPILER_OPTIMIZATION_SIZE` is still `y` (not `PERF`) and that nothing new is `REQUIRES`d in `src/CMakeLists.txt` that isn't actually needed.
 
@@ -94,7 +95,7 @@ Don't guess at what's consuming flash — measure it. `xtensa-esp-elf-gcc-nm --p
 
 ### Flash size is configured in two independent places
 
-`board_build.flash_size` sets `CONFIG_ESPTOOLPY_FLASHSIZE` (what ESP-IDF believes); `board_upload.flash_size` sets the size nibble in the image header that esptool writes (what the hardware acts on). Both must say `8MB`. If only the first is set, the header silently inherits 4 MB from the `esp32dev` board manifest and the board never sees half of its flash (header < chip only warns). The reverse — a header claiming *more* than the chip has — makes `esp_flash_init_default_chip()` fail with `ESP_ERR_FLASH_SIZE_NOT_MATCH` ("Probe failed"), a hard error, so the board never boots. Verify with the first 4 bytes of `firmware.bin`/`bootloader.bin` rather than trusting sdkconfig.
+`board_build.flash_size` sets `CONFIG_ESPTOOLPY_FLASHSIZE` (what ESP-IDF believes); `board_upload.flash_size` sets the size nibble in the image header that esptool writes (what the hardware acts on). Both must match the selected environment: `4MB` for `wt32-eth01-4mb`, `8MB` for the upstream `wt32-eth01`. If only the first is set, the header silently inherits 4 MB from the `esp32dev` board manifest and the board never sees half of its flash (header < chip only warns). The reverse — a header claiming *more* than the chip has — makes `esp_flash_init_default_chip()` fail with `ESP_ERR_FLASH_SIZE_NOT_MATCH` ("Probe failed"), a hard error, so the board never boots. Verify with the first 4 bytes of `firmware.bin`/`bootloader.bin` rather than trusting sdkconfig.
 
 The same split applies to flash *frequency*: `CONFIG_ESPTOOLPY_FLASHFREQ` may still read `40m` in the generated sdkconfig while the actual header says 80 MHz, because PlatformIO patches it in at esptool time. The header wins — check there.
 
@@ -117,10 +118,10 @@ These rules are binding for every change, in every file (C/C++, headers, CMake, 
 
 `src/main.cpp`'s `app_main()` calls `bridge_setup()` once then loops `bridge_loop()` forever — the direct ESP-IDF replacement for Arduino's `setup()`/`loop()`. Two mutually exclusive modes, decided at boot:
 
-- **Provisioning mode**: no Wi-Fi credentials stored, or the factory-reset GPIO (IO14, pulled low for 2s) was held at boot, or no Ethernet client was seen within `MAC_SNIFF_TIMEOUT_MS`. Starts an AP (`web.cpp: portal_start_ap()`) plus the HTTP portal, and does nothing else — Ethernet bridging is not attempted.
-- **Bridge mode**: Ethernet client MAC is sniffed, Wi-Fi STA connects using that *cloned* MAC, then the data path is activated and the HTTP server + MQTT telemetry start on the management IP.
+- **Provisioning mode**: no Wi-Fi credentials stored, or the provisioning GPIO (IO14 on WT32, IO4 on C5) was held low for 3s at boot or held and released during operation, or no Ethernet client was seen within `MAC_SNIFF_TIMEOUT_MS`. Starts an AP (`web.cpp: portal_start_ap()`) plus the HTTP portal, and does nothing else — Ethernet bridging is not attempted.
+- **Bridge mode**: Ethernet client MAC is sniffed, Wi-Fi STA connects using that *cloned* MAC, then the data path and MQTT telemetry start on the static IPv4. HTTP, NetBIOS and SNTP do not start in bridge mode. The GPIO enters provisioning without erasing settings; factory erase currently requires serial tools.
 
-OTA rollback confirmation (`ota_confirm_if_pending()`) is deliberately gated on "reachable over the network for 30s", not "booted" — the board has no serial access once deployed, so a boot that succeeds but leaves networking broken must still roll back.
+OTA rollback confirmation (`ota_confirm_if_pending()`) requires 30 seconds of continuous local bridge readiness (active path, Wi-Fi association and Ethernet link), or an unconfigured provisioning session — the board has no serial access once deployed, so a boot that succeeds but leaves networking broken must still roll back.
 
 ### The bridge data path (`bridge.cpp`)
 
@@ -154,7 +155,9 @@ Single self-contained HTML/CSS/JS page (`PAGE[]`) served at `/`, plus a small JS
 
 The "Console log" box in the portal shows the serial console over the network: `conlog.cpp` swaps `stdout` for a `funopen()` stream at the very start of `app_main()` (tasks inherit `stdout` from `_GLOBAL_REENT` when created, so it must come first), keeps the last 8 KB in a ring buffer and still forwards everything to the real console. `GET /api/log?since=N` returns up to 2 KB from byte position `N`, with `X-Log-Next` for the next poll and `X-Log-Reset: 1` after a reboot or ring wrap; it is guarded by the admin key like the other diagnostics. Only `printf`/`ESP_LOG` output is captured — ROM and bootloader output (`esp_rom_printf`) never goes through `stdout`.
 
-OTA from the command line: `scripts/ota_flash.sh <ip> [admin-key] [pio-env]` (env defaults to `wt32-eth01`) builds, archives the matching `firmware.elf` under `elf_archive/` and uploads.
+The provisioning AP uses a persisted per-device random password printed directly to local serial, bypassing the web log ring. Capture it before deployment. Provisioning API authentication is still incomplete; physical setup is not yet a production security boundary.
+
+OTA from the command line (provisioning only): `scripts/ota_flash.sh <ip> [admin-key] [pio-env]` (env defaults to `wt32-eth01-4mb`) builds, archives the matching `firmware.elf` under `elf_archive/` and uploads.
 
 ### Telemetry (`telemetry.cpp`)
 
@@ -162,7 +165,7 @@ Optional MQTT client (only starts if `mqtt_host` is configured), publishes state
 
 ### Partition layout
 
-`partitions_8mb_ota.csv` is the live table: 24 KB NVS, 8 KB otadata, two 3 MB OTA app slots, a 64 KB coredump partition, ~1.8 MB unallocated reserve. The partition table cannot be changed via OTA, hence the generous slots. App partitions must start on 64 KB boundaries, hence the gap after otadata. (`partitions_2mb_ota.csv` is the obsolete leftover from the mistaken 2 MB belief — not referenced by the build.)
+`partitions_4mb_ota.csv` is the default WT32 deployment table: two 1920 KB OTA slots, 24 KB NVS, 8 KB otadata and 64 KB coredump, ending at 0x3F0000. `partitions_8mb_ota.csv` remains the upstream 8 MB environment table: 24 KB NVS, 8 KB otadata, two 3 MB OTA app slots, a 64 KB coredump partition, ~1.8 MB unallocated reserve. The partition table cannot be changed via OTA, hence the generous slots. App partitions must start on 64 KB boundaries, hence the gap after otadata. (`partitions_2mb_ota.csv` is the obsolete leftover from the mistaken 2 MB belief — not referenced by the build.)
 
 ### Second target: ESP32-C5 + W5500 (`nicemcu-c5-w5500`)
 

@@ -1,3 +1,9 @@
+> Deployment fork: the default build is now `wt32-eth01-4mb` (4 MB WT32,
+> two 1920 KB OTA slots). The original `wt32-eth01` environment remains 8 MB.
+> Read [the deployment guide](docs/content/wt32-deployment.md) before flashing:
+> HTTP/OTA is provisioning-only and the physical setup input preserves settings.
+> Firmware runtime changes require hardware verification before unattended use.
+
 # ESP32 Wi-Fi Bridge on Steroids
 
 A **transparent Layer-2 Wi-Fi ↔ Ethernet bridge** for the WT32-ETH01 — and, as a second target, an ESP32-C5 with a W5500 SPI Ethernet module (dual-band 2.4/5 GHz) — with a web portal, a JSON API, MQTT telemetry with Home Assistant autodiscovery, over-the-air updates, a self-healing watchdog, crash forensics and live performance tuning.

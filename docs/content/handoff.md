@@ -1,10 +1,10 @@
 # Handoff
 
-## Deployment fork planning status
+## Deployment fork implementation status
 
-The heat-pump deployment design is documented in [implementation-design.md](implementation-design.md). First-choice hardware is WT32-ETH01. Olimex ESP32-POE-ISO-EA-16MB is a secondary candidate whose internal RMII clock and concurrent Wi-Fi require qualification if revisited; that work does not block WT32 implementation. This is a documentation-only plan; no firmware changes, new-target builds or device tests have been performed. The upstream deployment snapshot below describes existing firmware, not completed work on this plan.
+WT32-ETH01 is the first-choice hardware. The first implementation slice adds the default 4 MB build target and provisioning-only HTTP/OTA, removes NetBIOS/SNTP startup, and changes the physical GPIO gesture to non-destructive setup. Setup uses a persistent random AP credential shown only on local serial. OTA acceptance waits for 30 continuous seconds of local link readiness. See [wt32-deployment.md](wt32-deployment.md) for commissioning, migration and remaining work, and [implementation-design.md](implementation-design.md) for the full proposed architecture.
 
-Technical state for whoever (human or Claude) picks up the next coding session. This file reflects the *current* state only — overwrite it each time; it is not a log (that's `history.md`) and not project-level context (that's `handover.md`).
+No device tests have been performed. Watchdog/profile gateway ping, MQTT isolation, full provisioning API authentication and configuration validation still need implementation. The upstream snapshot below describes the prior deployed firmware and must not be read as validation of this fork's changes.
 
 ## State as of 2026-09-05
 
