@@ -1,4 +1,4 @@
-# agents.md
+# AGENTS.md
 
 Instructions for AI assistants and contributors working in this repository. Read this file before making changes.
 
