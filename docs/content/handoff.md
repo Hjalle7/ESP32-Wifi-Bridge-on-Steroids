@@ -6,7 +6,7 @@ Technical state for whoever (human or Claude) picks up the next coding session. 
 
 The firmware is **verified on real hardware and in continuous use** bridging a live IP camera. Bridge data path, management IP, config portal, MQTT, OTA, two network profiles with automatic location detection, a three-stage self-healing watchdog, and a crash-forensics endpoint — all exercised on the deployed board, not just compile-tested.
 
-Updates go over the network (`POST /api/update`, or `scripts/ota_flash.sh <ip> [admin-key]` which also archives the matching `.elf` — see below); the serial cable is only needed if the board becomes unreachable. Build with `~/.pio-py313/bin/pio` — see `CLAUDE.md` for why plain `pio` fails.
+Updates go over the network (`POST /api/update`, or `scripts/ota_flash.sh <ip> [admin-key]` which also archives the matching `.elf` — see below); the serial cable is only needed if the board becomes unreachable. Build with `~/.pio-py313/bin/pio` — see `agents.md` for why plain `pio` fails.
 
 **Throughput is settled — don't reopen it without new information.** See `backlog.md` for what was tried; `history.md` (2026-08-14/15) has the full comparison against the Rust original and the methodological lesson.
 

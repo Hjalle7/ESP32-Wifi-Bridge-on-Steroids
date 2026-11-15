@@ -1,6 +1,52 @@
-# CLAUDE.md
+# agents.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Instructions for AI assistants and contributors working in this repository. Read this file before making changes.
+
+
+## Planned direction for this fork
+
+The following requirements describe the agreed target, not features already implemented. The architecture sections below document the current firmware; where they differ, use this section to guide new work. Extend the existing implementation rather than rewriting it.
+
+### Normal bridge operation
+
+- Preserve transparent Ethernet–Wi-Fi layer-2 bridging and client MAC cloning. The Ethernet client remains in the existing IoT VLAN and IP subnet, with DHCP supplied by the existing router. Do not introduce NAT, a separate subnet, or a WDS requirement.
+- Keep a separate static IPv4 address on the ESP32 for outbound MQTT telemetry and its required reply traffic. It must not conflict with the Ethernet client's address or the DHCP pool. IPv6 is not used in the target VLAN.
+- Run no HTTP server, administration API, or other listening management service in normal operation. Removing the web server must not remove the IP stack needed for MQTT.
+- MQTT is telemetry only: no command subscriptions or remote-control features. MQTT failures and reconnects must not block or degrade bridging.
+- Make watchdog detection and recovery local, independent of gateway ping, DNS, MQTT, or other IP communication. Preserve staged recovery and distinguish an idle client from a failed link.
+
+### Provisioning and configuration
+
+- Provide an explicit way to enter the setup AP and web portal without a factory reset, preserving saved settings. Keep factory reset a separate deliberate action.
+- Allow editing Wi-Fi credentials, static IPv4 address, netmask, gateway, DNS server, MQTT broker, port, and credentials in provisioning mode.
+- Start the web server and administrative endpoints only in provisioning mode. Use a unique strong AP password; do not retain the shared default password.
+- Validate configuration before saving and preserve backward compatibility with existing NVS blobs. The append-only BridgeConfig layout contract remains binding.
+- Decide the physical entry sequence, reboot-persistent provisioning request, timeout, return to normal operation, and whether bridging continues during provisioning before implementing them.
+- Decide whether firmware updates use provisioning-only OTA, USB, or both. Preserve OTA rollback and define its confirmation criteria for the revised modes.
+
+### Design questions to resolve
+
+- Preserve correct ARP and IPv4 delivery with the cloned MAC shared by the Ethernet client and the ESP32's distinct static address. Do not consume packets intended for the client.
+- Replace ping-based location detection separately from watchdog probing; profiles may share an SSID.
+- Isolate MQTT publishing and reconnect handling from the forwarding path, including broker outages.
+- Evaluate MQTT TLS, certificate handling, and broker authentication. Use broker ACLs appropriate for telemetry and Home Assistant discovery.
+- Define router rules restricting ESP32-originated traffic to required services without breaking the bridged client's traffic.
+- Review secret storage, Secure Boot, and Flash Encryption before production deployment.
+- BRIDGE_MINIMAL is a measurement/rollback variant without MQTT, not the target production configuration.
+
+### Implementation order and validation
+
+1. Complete read-only mapping of network interfaces, frame routing, MQTT, watchdog, provisioning, NVS, and both build targets.
+2. Design the STA IPv4/MQTT path and the normal/provisioning mode lifecycle.
+3. Restrict the web server and administrative endpoints to provisioning.
+4. Replace watchdog gateway probing with local indicators and validate staged recovery.
+5. Replace ping-based profile selection.
+6. Verify outbound-only MQTT and non-blocking failure handling.
+7. Add validated static IPv4/DNS configuration with backward-compatible persistence.
+8. Build the affected WT32-ETH01 and ESP32-C5/W5500 configurations.
+9. On hardware, verify DHCP/ARP, bidirectional traffic and Modbus TCP, MAC cloning after reboot/client replacement, provisioning without data loss, recovery/OTA, broker outages, and long-term stability.
+
+Use a separate branch for changes; leave main unchanged until review and merge. Record actual implementation status in docs/content/handoff.md and open work in docs/content/backlog.md. Do not describe planned behavior as verified. Throughput remains settled unless new evidence justifies investigation.
 
 ## What this is
 
@@ -10,7 +56,7 @@ Pure ESP-IDF via PlatformIO (`framework = espidf`) — no Arduino. The project u
 
 ## Commands
 
-**Use `~/.pio-py313/bin/pio`, not plain `pio`.** See "Toolchain" below — plain `pio` aborts with a Python version error on this machine.
+**On the original development machine, use `~/.pio-py313/bin/pio`, not plain `pio`.** See "Toolchain" below. On other machines, use an available compatible PlatformIO environment; do not assume this local path exists.
 
 ```bash
 ~/.pio-py313/bin/pio run -e wt32-eth01                 # build
@@ -59,7 +105,7 @@ These rules are binding for every change, in every file (C/C++, headers, CMake, 
 - **Comments describe the code as it is, not how it got there.** No dates, no incident narratives ("seen on 2026-08-14 in the lab"), no "previously this was X", no "I first tried …", no field-appended-on markers. Keep the *reason* a design decision was made (e.g. "retries default to 8 because dropped UDP frames are lost for good"), drop the story. History belongs in `docs/content/history.md`, open work in `docs/content/backlog.md`.
 - **Nothing personal in the code**: no personal names, home/lab locations, specific personal devices, private network details. Use neutral wording ("the bridged client", "an IP camera", "a second site").
 
-## Architecture
+## Current implementation architecture
 
 ### Entry point and lifecycle
 
