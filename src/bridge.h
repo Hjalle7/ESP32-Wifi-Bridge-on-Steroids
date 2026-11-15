@@ -21,10 +21,9 @@ struct BridgeStats {
   uint32_t kbps_wifi2eth;
   uint32_t wifi_disc_count;   /* WIFI_EVENT_STA_DISCONNECTED since boot, for
                                * the watchdog and for diagnosis in the portal */
-  uint8_t  wd_probe;          /* result of the last watchdog gateway probe:
-                               * 0=not needed/off, 1=ok, 2=failed             */
+  uint8_t  wd_probe;          /* legacy field, always zero (no IP probes) */
   uint32_t wd_eth_resets;     /* watchdog-triggered Ethernet resets since boot
-                               * (escalation level "no client traffic")       */
+                               * (local transmit failures)       */
   uint32_t wd_reconnects;     /* watchdog-triggered Wi-Fi reconnects since boot */
   uint8_t  wd_last_reason;    /* reason of the last forced watchdog reboot
                                * (highest escalation level): 0=none since

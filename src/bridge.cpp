@@ -40,8 +40,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-/* For the location detection via gateway ping (see gateway_reachable). */
-#include "ping/ping_sock.h"
+/* Local-only health policy, shared with host regression checks. */
+#include "local_watchdog.h"
 
 #if defined(__has_include)
 #  if __has_include("esp_private/esp_wifi_internal.h")
@@ -1149,72 +1149,6 @@ static inline bool ip_is_set(const uint8_t a[4]) {
   return (a[0] | a[1] | a[2] | a[3]) != 0;
 }
 
-/* ---------------------------------------------------------------------------
- * Location detection via gateway ping
- *
- * The obvious idea of tying the profile to the SSID slot does not work: the
- * same SSID can exist at several sites. Then slot 1 would always connect and
- * profile 2 would never be used.
- *
- * So we ask the network itself: apply a profile, ping its gateway, and if it
- * stays silent try the next profile. This needs no extra input - the gateway
- * is part of the configuration anyway - and survives router or mesh changes,
- * unlike a hard-coded BSSID.
- * ------------------------------------------------------------------------ */
-
-static volatile bool s_ping_reply;
-
-/* esp_ping success callback: any reply is enough. */
-static void ping_ok_cb(esp_ping_handle_t hdl, void *args) {
-  (void)hdl; (void)args;
-  s_ping_reply = true;
-}
-
-/* Ping `gw` over the management netif and wait up to total_ms for a reply.
- * Blocks the caller. Returns true on the first reply. If no ping session can
- * be created, returns true as well - an internal error must not be mistaken
- * for "unreachable" (that would make the bridge switch profiles or the
- * watchdog escalate for no reason). */
-static bool gateway_reachable(const uint8_t gw[4], uint32_t total_ms) {
-  if (!ip_is_set(gw)) return false;
-
-  s_ping_reply = false;
-
-  esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
-  cfg.count       = 4;
-  cfg.interval_ms = 250;
-  cfg.timeout_ms  = 400;
-  cfg.data_size   = 8;      /* keep it small, we only want a sign of life */
-  /* ip_addr_t is NOT always the same struct: with IPv6 disabled
-   * (CONFIG_LWIP_IPV6=n, see sdkconfig.defaults) lwIP shrinks the type to
-   * struct ip4_addr - then there is neither .type nor the u_addr union. Not
-   * to be confused with esp_netif_dns_info_t further down, which is
-   * esp_ip_addr_t and keeps the union regardless. */
-#if LWIP_IPV6
-  cfg.target_addr.type = IPADDR_TYPE_V4;
-  memcpy(&cfg.target_addr.u_addr.ip4.addr, gw, 4);
-#else
-  memcpy(&cfg.target_addr.addr, gw, 4);
-#endif
-
-  esp_ping_callbacks_t cbs = {};
-  cbs.on_ping_success = ping_ok_cb;
-
-  esp_ping_handle_t h = NULL;
-  if (esp_ping_new_session(&cfg, &cbs, &h) != ESP_OK) {
-    printf("[WIFI] Ping session failed - keeping profile\n");
-    return true;
-  }
-  esp_ping_start(h);
-
-  const uint32_t t0 = millis();
-  while (!s_ping_reply && (millis() - t0) < total_ms) delay(50);
-
-  esp_ping_stop(h);
-  esp_ping_delete_session(h);
-  return s_ping_reply;
-}
-
 /* Access to the three network profiles without special cases at every call
  * site. Index 0 = profile 1 (always valid), 1 = profile 2, 2 = profile 3. */
 static const uint8_t *profile_ip(size_t i)   { return i==2 ? g_cfg.mgmt_ip3   : i==1 ? g_cfg.mgmt_ip2   : g_cfg.mgmt_ip;   }
@@ -1228,8 +1162,8 @@ static bool profile_in_use(size_t i) { return i == 0 || ip_is_set(profile_ip(i))
  * Apply the IP settings of profile `idx` to the management netif (falls back
  * to profile 1 if that profile is not in use).
  *
- * This cannot be done once before connecting: which network the bridge ends
- * up in is only known afterwards (see detect_location()).
+ * The selected profile is explicit and is reapplied after a connection or
+ * failover without probing any gateway.
  *
  * Empty mask/gateway fields inherit from profile 1 - a half-filled profile
  * should leave the board reachable instead of configuring it into the void
@@ -1269,37 +1203,12 @@ static void mgmt_apply_ip(size_t idx) {
 }
 
 #ifndef BRIDGE_MINIMAL
-/* Determine which site we are at, after the Wi-Fi connect succeeded.
- *
- * Tries every profile in use, starting with `preferred` (the profile of the
- * SSID slot that connected, the most likely match): apply it, ping its
- * gateway, stop at the first one that answers. If none answers, fall back to
- * the preferred profile - a possibly wrong but predictable address is better
- * than whichever one happened to be set last. */
-static void detect_location(size_t preferred) {
-  size_t order[3]; size_t n = 0;
-  if (profile_in_use(preferred)) order[n++] = preferred;
-  for (size_t k = 0; k < 3; k++)
-    if (k != preferred && profile_in_use(k)) order[n++] = k;
-  if (!n) { mgmt_apply_ip(0); return; }
-
-  /* Only one profile in use - nothing to decide, and we save the ping wait
-   * at boot. */
-  if (n == 1) { mgmt_apply_ip(order[0]); return; }
-
-  for (size_t j = 0; j < n; j++) {
-    mgmt_apply_ip(order[j]);
-    if (gateway_reachable(profile_gw(order[j]), 2500)) {
-      printf("[WIFI] Gateway of profile %u answers - location detected\n",
-             (unsigned)(order[j] + 1));
-      return;
-    }
-    printf("[WIFI] Profile %u does not answer\n", (unsigned)(order[j] + 1));
-  }
-  printf("[WIFI] No gateway answers - staying with profile %u\n",
-         (unsigned)(order[0] + 1));
-  mgmt_apply_ip(order[0]);
+/* Apply the explicitly selected telemetry-IP profile without network probes.
+ * SSID identity is not sufficient to distinguish different IP networks. */
+static void apply_selected_profile(void) {
+  mgmt_apply_ip(g_cfg.ip_profile <= 2 ? g_cfg.ip_profile : 0);
 }
+
 #endif
 
 /* --- Configured networks ------------------------------------------------- */
@@ -1515,8 +1424,8 @@ static bool scan_visible_nets(bool vis[3], wifi_ap_record_t best[3], bool have[3
  * Steps: create the management netif with a static IP, initialize the Wi-Fi
  * driver with the configured buffer sizes (with a staged fallback if init
  * fails), apply protocol/bandwidth settings, then try each configured SSID
- * with several attempts. On success the location detection selects the
- * matching IP profile. */
+ * with several attempts. The explicitly selected IP profile is applied
+ * before association, avoiding a provisional address on another subnet. */
 bool bridge_wifi_start(void) {
 #ifdef BRIDGE_MINIMAL
   /* Measurement variant: NO management netif. Without s_mgmt_netif,
@@ -1535,9 +1444,9 @@ bool bridge_wifi_start(void) {
   }
   esp_netif_dhcpc_stop(s_mgmt_netif);
 
-  /* Apply profile 1 provisionally, so the netif never sits without a valid
-   * address. After a successful connect the matching profile is applied. */
-  mgmt_apply_ip(0);
+  /* Apply the selected profile before associating; never advertise a
+   * provisional address from a different saved IP network. */
+  apply_selected_profile();
 #endif
 
   /* WIFI_INIT_CONFIG_DEFAULT() already takes static_rx_buf_num,
@@ -1770,7 +1679,7 @@ bool bridge_wifi_start(void) {
         s_cur_net = la.slot;
         esp_log_level_set("wifi", ESP_LOG_WARN);
 #ifndef BRIDGE_MINIMAL
-        detect_location(la.slot);
+        apply_selected_profile();
 #endif
         return true;
       }
@@ -1825,12 +1734,10 @@ bool bridge_wifi_start(void) {
     if (s_wifi_up) {
       s_cur_net = (uint8_t)i;
       esp_log_level_set("wifi", ESP_LOG_WARN);
-      /* Connected - but at WHICH site? The SSID slot does not tell when
-       * several sites share the same SSID. So try the profiles in use and
-       * ping their gateways, starting with the profile of the connected slot
-       * because it is the most likely match. */
+      /* The operator selects the telemetry IP profile explicitly; roaming
+       * or matching an SSID must not guess a different IP network. */
 #ifndef BRIDGE_MINIMAL
-      detect_location(i);
+      apply_selected_profile();
 #endif
       return true;
     }
@@ -2933,80 +2840,18 @@ static void tune_all_tick(void) {
   s_all_stage = ALL_STOPPED;     /* next stage refused to start */
 }
 
-/* ===========================================================================
- * Watchdog
- *
- * Detects a bridge that the driver still reports as connected (wifi_up =
- * true, normal RSSI) but that hardly delivers any packets anymore - a state
- * that can follow heavy RF interference and persist until a reboot. Neither
- * RSSI nor wifi_up reveal it; the signals that do are the loss ratio in the
- * LAN->Wi-Fi path under load and frequent reassociations. Both are evaluated
- * per time window, and several bad windows in a row trigger an escalation.
- *
- * When there is too little real traffic to judge (e.g. the camera is not
- * streaming), the bridge would otherwise be blind to exactly that state. So
- * in that case it actively probes - a ping to the Wi-Fi gateway via the
- * management netif (gateway_reachable(), otherwise only used at boot for the
- * location detection). Deliberately NOT the client itself: the bridge carries
- * the client's cloned MAC on the STA interface, so an ICMP from the
- * management stack to the client IP would resolve via ARP to our OWN MAC - a
- * round trip through ourselves that tests nothing. Reaching the gateway, by
- * contrast, goes through the same lwIP/netif/radio path the management HTTP
- * uses - a useful proxy, without touching the fragile raw-frame path in
- * eth_rx_cb/wifi_rx_cb.
- * ========================================================================= */
+/* Local watchdog evaluates driver state and forwarding errors every twenty
+ * seconds. Silence and cable removal are not faults. Wi-Fi disassociation
+ * only requests reconnects, never rebooting the board for an AP outage. */
+#define WD_WINDOW_MS 20000u
+#define WD_ACTION_COOLDOWN_MS 60000u
 
-#define WD_WINDOW_MS           20000u  /* measurement window - long enough not
-                                        * to react to a brief fluctuation     */
-#define WD_MIN_PACKETS            200u  /* below this, the counters say nothing */
-#define WD_LOSS_PERMILLE         150u  /* 15 % loss in the window = "bad"     */
-#define WD_DISC_PER_WINDOW          4  /* this many reconnects in a window = "bad" */
-#define WD_ETH_STALL_PACKETS        5  /* below this (LAN->Wi-Fi, raw, not only
-                                        * dropped) with the link up, the client
-                                        * counts as silent - see below.       */
-/* How many bad windows in a row until the next escalation level:
- * g_cfg.wd_bad_windows, 0 = WD_BAD_WINDOWS_DEF (bridge.h). */
-#define WD_PROBE_BUDGET_MS      1200u  /* upper limit for the gateway probe -
-                                        * briefly blocks bridge_tick()        */
-
-/*
- * Three-level escalation instead of an immediate esp_restart().
- *
- * A full reboot briefly takes down the Ethernet MAC/PHY - that takes the
- * attached camera offline for the duration of the boot, and depending on its
- * firmware it may need minutes to recover. More importantly: a reboot does
- * not fix a bad radio environment - if the interference is still there, the
- * new connect attempt after the reboot fails just like a simple reconnect.
- * A reboot is only the right response when the Wi-Fi driver itself is hung.
- *
- * Which escalation comes first depends on the SYMPTOM:
- *
- * - WD_REASON_ETH_STALL (link up, but practically no traffic from the client
- *   - see the detection below): first only the Ethernet driver is restarted
- *   (bridge_reset_eth()), Wi-Fi completely untouched. A pure Wi-Fi problem
- *   must NOT take this path - an Ethernet reset would not help and would
- *   disturb the client for no reason.
- * - Any other reason (loss ratio, reconnects, gateway probe - all Wi-Fi-side
- *   symptoms): disconnect Wi-Fi directly. wifi_evt() reconnects on
- *   WIFI_EVENT_STA_DISCONNECTED automatically while s_active is set - no
- *   extra esp_wifi_connect() needed.
- *
- * If the first step does not help (the symptom persists), the Wi-Fi
- * reconnect ALWAYS comes next (unless already tried). If that does not help
- * either: last resort, a full reboot - but via abort() instead of
- * esp_restart(), so a coredump is written: the next boot should be traceable
- * (the backtrace points exactly at this code, and the reason is additionally
- * kept in bridge_get_stats()->wd_last_reason, which survives the reboot in
- * RTC memory). Deliberately, no level counts as a failed boot - the Ethernet
- * reset and reconnect do not reboot at all, and even the final reboot is a
- * clean boot, not a failed one.
- */
 typedef enum {
   WD_REASON_NONE        = 0,
   WD_REASON_LOSS        = 1,   /* loss ratio above the threshold */
   WD_REASON_DISCONNECTS = 2,   /* too many reconnects in the window */
-  WD_REASON_PROBE       = 3,   /* gateway probe failed */
-  WD_REASON_ETH_STALL   = 4,   /* link up, but no traffic from the client */
+  WD_REASON_WIFI_DOWN   = 3,   /* Wi-Fi reports disconnected */
+  WD_REASON_ETH_STALL   = 4,   /* Ethernet transmit failures under load */
 } wd_reason_t;
 
 /* Short code for a watchdog reason, used in logs and MQTT events. */
@@ -3014,8 +2859,8 @@ static const char *wd_reason_str(uint8_t r) {
   switch (r) {
     case WD_REASON_LOSS:        return "loss";
     case WD_REASON_DISCONNECTS: return "disconnects";
-    case WD_REASON_PROBE:       return "probe";
-    case WD_REASON_ETH_STALL:   return "eth_stall";
+    case WD_REASON_WIFI_DOWN:   return "wifi_down";
+    case WD_REASON_ETH_STALL:   return "eth_tx";
     default:                    return "";
   }
 }
@@ -3095,9 +2940,12 @@ bool bridge_consume_requested_restart(void) {
 }
 
 static uint32_t s_wd_t0 = 0, s_wd_pkt0 = 0, s_wd_drop0 = 0, s_wd_disc0 = 0;
+static uint32_t s_wd_eth_pkt0 = 0, s_wd_eth_drop0 = 0;
+static uint32_t s_wd_last_action = 0, s_wd_healthy_since = 0;
+RTC_NOINIT_ATTR static uint32_t s_wd_reboot_budget;
+static uint8_t s_wd_previous_reason = 0;
 static uint8_t  s_wd_bad = 0;
-static uint8_t  s_wd_probe = 0;   /* 0=not needed/off, 1=ok, 2=failed -
-                                   * for /api/status, see BridgeStats.wd_probe */
+static uint8_t s_wd_probe = 0;   /* legacy field, always zero: no IP probes */
 static uint8_t  s_wd_stage = WD_STAGE_NORMAL;
 static uint32_t s_wd_reconnects = 0;   /* since boot, for /api/status/MQTT */
 static uint32_t s_wd_eth_resets = 0;   /* since boot, for /api/status/MQTT */
@@ -3121,25 +2969,9 @@ bool bridge_reset_eth(void) {
   return true;
 }
 
-/* Read the gateway currently configured on the management netif - asked
- * directly from the netif, which is the authoritative source after
- * mgmt_apply_ip(), instead of re-deriving it from g_cfg and the profile
- * choice. Returns false if there is no netif or no gateway. */
-static bool wd_get_gateway(uint8_t gw[4]) {
-  if (!s_mgmt_netif) return false;
-  esp_netif_ip_info_t ip = {};
-  if (esp_netif_get_ip_info(s_mgmt_netif, &ip) != ESP_OK) return false;
-  memcpy(gw, &ip.gw.addr, 4);
-  return gw[0] || gw[1] || gw[2] || gw[3];
-}
-
-/* Watchdog state machine; called from bridge_tick().
- *
- * At the end of every WD_WINDOW_MS window it classifies the window as good or
- * bad (loss ratio with enough traffic; otherwise a gateway probe, plus the
- * client-silence check; reconnect churn always), counts consecutive bad
- * windows and, once wd_bad_windows is reached, takes the next allowed action
- * from wd_next_action(). A good window ends any running escalation. */
+/* Evaluate local health and perform bounded recovery without IP probes.
+ * A healthy interval clears escalation; reboot budget resets after ten
+ * minutes of healthy local observations, never on a broker response. */
 static void watchdog_tick(void) {
   /* No evaluation during OTA (s_paused) or outside bridge operation - a
    * reboot in the middle of a firmware flash would be fatal, and without an
@@ -3153,6 +2985,7 @@ static void watchdog_tick(void) {
   if (s_wd_t0 == 0) {
     s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_drop_e2w;
     s_wd_disc0 = s_wifi_disc_count;
+    s_wd_eth_pkt0 = s_pkt_w2e; s_wd_eth_drop0 = s_drop_w2e;
     return;
   }
   if (now - s_wd_t0 < WD_WINDOW_MS) return;
@@ -3163,40 +2996,20 @@ static void watchdog_tick(void) {
   s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_drop_e2w;
   s_wd_disc0 = s_wifi_disc_count;
 
-  bool bad = false;
-  uint8_t reason = WD_REASON_NONE;
+  const uint32_t ep = s_pkt_w2e - s_wd_eth_pkt0;
+  const uint32_t ed = s_drop_w2e - s_wd_eth_drop0;
+  s_wd_eth_pkt0 = s_pkt_w2e; s_wd_eth_drop0 = s_drop_w2e;
+  s_wd_probe = 0;  /* legacy field: no active probe */
+  const uint8_t reason = local_watchdog_reason(s_eth_link, s_wifi_up, dp, dd, ep, ed, ddisc);
+  const bool bad = reason != WD_REASON_NONE;
 
-  if (dp + dd >= WD_MIN_PACKETS) {
-    /* Enough real traffic - the loss ratio decides, no probe needed (saves
-     * airtime during a running stream). */
-    s_wd_probe = 0;
-    const uint32_t permille = (1000ULL * dd) / (dp + dd);
-    if (permille >= WD_LOSS_PERMILLE) { bad = true; reason = WD_REASON_LOSS; }
-  } else {
-    uint8_t gw[4];
-    if (!wd_get_gateway(gw)) {
-      s_wd_probe = 0;   /* no gateway known - nothing can be concluded */
-    } else if (gateway_reachable(gw, WD_PROBE_BUDGET_MS)) {
-      s_wd_probe = 1;
-      /* Wi-Fi demonstrably fine - but that does not answer whether the
-       * client itself still delivers anything. The intended client (a camera)
-       * streams continuously, so real silence with the link up is abnormal
-       * and a symptom of its own, not a Wi-Fi problem - hence a separate
-       * reason. */
-      if (s_eth_link && (dp + dd) < WD_ETH_STALL_PACKETS) {
-        bad = true; reason = WD_REASON_ETH_STALL;
-      }
-    } else {
-      s_wd_probe = 2;
-      bad = true; reason = WD_REASON_PROBE;
-    }
+  if (reason != s_wd_previous_reason) {
+    s_wd_previous_reason = reason;
+    s_wd_stage = WD_STAGE_NORMAL;
+    s_wd_bad = 0;
   }
-  /* Reconnects take precedence - if several apply, frequent reassociation is
-   * the more telling symptom. */
-  if (ddisc >= WD_DISC_PER_WINDOW) { bad = true; reason = WD_REASON_DISCONNECTS; }
-
   const uint8_t bad_max = wd_bad_windows_eff();
-  s_wd_bad = bad ? (uint8_t)(s_wd_bad + 1) : 0;
+  s_wd_bad = bad ? (s_wd_bad < 255 ? s_wd_bad + 1 : 255) : 0;
   printf("[WD  ] Stage %u, window: %u packets, %u lost, %u reconnects, probe=%u, reason=%s -> %s (%u/%u)\n",
          (unsigned)s_wd_stage, (unsigned)(dp + dd), (unsigned)dd, (unsigned)ddisc,
          (unsigned)s_wd_probe, wd_reason_str(reason), bad ? "bad" : "ok",
@@ -3205,9 +3018,16 @@ static void watchdog_tick(void) {
   if (!bad) {
     /* Recovered - any running escalation is finished. */
     s_wd_stage = WD_STAGE_NORMAL;
+    if (!s_eth_link || !s_wifi_up) s_wd_healthy_since = 0;
+    else {
+      if (!s_wd_healthy_since) s_wd_healthy_since = now;
+      if (now - s_wd_healthy_since >= 600000u) s_wd_reboot_budget = 0;
+    }
     return;
   }
-  if (s_wd_bad < bad_max) return;
+  s_wd_healthy_since = 0;
+  if (s_wd_bad < bad_max || (s_wd_last_action && now - s_wd_last_action < WD_ACTION_COOLDOWN_MS)) return;
+  s_wd_last_action = now;
 
   /* The next window starts fresh after every escalation step - the action
    * itself takes a few seconds, which should not be held against the window
@@ -3215,7 +3035,9 @@ static void watchdog_tick(void) {
   s_wd_bad = 0;
   s_wd_t0  = 0;
 
-  const uint8_t next = wd_next_action(s_wd_stage, reason);
+  const uint8_t next = (reason == WD_REASON_WIFI_DOWN || reason == WD_REASON_DISCONNECTS)
+      ? static_cast<uint8_t>((wd_actions_eff() & WD_ACT_WIFI_RECON) ? WD_STAGE_WIFI_RECONNECT : WD_STAGE_NORMAL)
+      : wd_next_action(s_wd_stage, reason);
 
   if (next == WD_STAGE_NORMAL) {
     /* No action is enabled in the portal for this symptom (e.g. a Wi-Fi
@@ -3227,7 +3049,7 @@ static void watchdog_tick(void) {
 
   if (next == WD_STAGE_ETH_RESET) {
     /* Client-side symptom -> reset only Ethernet, Wi-Fi stays untouched. */
-    printf("[WD  ] No traffic from the client despite link - resetting Ethernet\n");
+    printf("[WD  ] Ethernet transmit failures - resetting Ethernet\n");
     bridge_reset_eth();
     s_wd_eth_resets++;
     telemetry_note_watchdog_event("eth_reset", wd_reason_str(reason));
@@ -3242,8 +3064,12 @@ static void watchdog_tick(void) {
      * (s_active is always set here); an extra esp_wifi_connect() would be
      * redundant. */
     printf("[WD  ] Disconnecting Wi-Fi to reconnect\n");
-    disc_mark_own(DISC_SRC_WATCHDOG);
-    esp_wifi_disconnect();
+    if (s_wifi_up) {
+      disc_mark_own(DISC_SRC_WATCHDOG);
+      esp_wifi_disconnect();
+    } else {
+      esp_wifi_connect();
+    }
     s_wd_reconnects++;
     telemetry_note_watchdog_event("wifi_reconnect", wd_reason_str(reason));
     s_wd_stage = WD_STAGE_WIFI_RECONNECT;
@@ -3253,11 +3079,17 @@ static void watchdog_tick(void) {
   /* The enabled lower levels did not help (or are disabled) - highest
    * escalation level. abort() instead of esp_restart(), so a coredump is
    * written: the next boot should be traceable, not just "it rebooted". */
+  if (s_wd_reason_magic != WD_REASON_MAGIC) s_wd_reboot_budget = 0;
+  if (s_wd_reboot_budget >= 2) {
+    printf("[WD  ] Reboot budget exhausted; continuing local recovery\n");
+    s_wd_stage = WD_STAGE_NORMAL;
+    return;
+  }
   printf("[WD  ] No improvement - forcing reboot with coredump (reason %s)\n",
          wd_reason_str(reason));
   telemetry_note_watchdog_event("reboot", wd_reason_str(reason));
+  ++s_wd_reboot_budget;
   bridge_mark_planned_restart(reason);
-  delay(400);   /* let the log line and the MQTT publish go out */
   abort();
 }
 
@@ -3423,7 +3255,7 @@ static bool net_visible(size_t i) {
 }
 
 /* Failover/failback state machine; called from bridge_tick() (main task, so
- * the blocking scan and the gateway pings of detect_location() never run in
+ * the blocking scan and telemetry-profile application never run in
  * the event handler). */
 static void failover_tick(void) {
   if (!s_active || s_paused || s_restarting) return;
@@ -3454,7 +3286,7 @@ static void failover_tick(void) {
   if (s_fo_locate) {
     s_fo_locate = false;
 #ifndef BRIDGE_MINIMAL
-    detect_location(s_cur_net);
+    apply_selected_profile();
 #endif
   }
   if (s_fb_trying && s_cur_net == s_fb_target) {   /* failback succeeded */

@@ -35,6 +35,8 @@
 #include "esp_rom_sys.h"
 #include "bootloader_random.h"
 #include "nvs.h"
+#include "mbedtls/base64.h"
+#include "provisioning_auth.h"
 #include "esp_core_dump.h"
 #include "build_info.h"
 #include "crashlog.h"
@@ -44,6 +46,10 @@
 /* Separate from the configuration blob so ordinary edits preserve the AP
  * credential without changing the append-only BridgeConfig layout. */
 static char s_ap_password[33] = {};
+/* Snapshot credentials for this session; saving a new admin password takes
+ * effect on the next provisioning boot, never halfway through a request. */
+static char s_http_password[33] = {};
+static char s_http_basic[96] = {};
 
 static httpd_handle_t s_httpd = NULL;
 static bool           s_provisioning = false;
@@ -319,6 +325,8 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
   <h2>Configuration</h2>
   <label>Device name</label><input id="name">
 
+  <label>Telemetry IP profile (explicit selection, no gateway probing)</label>
+  <select id="ip_profile"><option value="0">Profile 1</option><option value="1">Profile 2</option><option value="2">Profile 3</option></select>
   <div class="tag live" style="background:rgba(77,163,255,.15);color:var(--acc)">Network 1</div>
   <label>Wi-Fi <a href="#" onclick="scan();return false" style="color:var(--acc)">(scan)</a></label>
   <div class="row"><input id="ssid1" list="nets" placeholder="SSID">
@@ -341,9 +349,9 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
   <label>Management IP <span class="hint">empty = use the same settings as network 1</span></label>
   <div class="row"><input id="ip3" placeholder="IP"><input id="mask3" placeholder="Netmask"><input id="gw3" placeholder="Gateway"></div>
   <div class="sub" style="margin:6px 0 0">
-    For several sites: the bridge tries the configured networks and applies
-    the IP settings of the network it actually ended up in (detected by
-    pinging each gateway). The same configuration then works at every site.
+    Select the telemetry IP profile for this network before leaving setup.
+    Wi-Fi networks may fail over, but the selected IP profile stays fixed.
+    An empty optional profile falls back to profile 1.
   </div>
 
   <label>MQTT broker (empty = off)</label>
@@ -351,7 +359,7 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
   <div class="row"><input id="mqtt_user" placeholder="User"><input id="mqtt_pass" type="password" placeholder="Password"></div>
 
   <label>Telemetry interval (s)</label><input id="telemetry_s">
-  <label>Admin key (protects firmware update and crash data, empty = open)</label>
+  <label>Admin password (all setup pages and APIs; effective next setup boot)</label>
   <input id="admin_pass" type="password" placeholder="leave empty = unchanged">
 
   <button class="hold" data-act="saverb">Save &amp; reboot</button>
@@ -568,16 +576,12 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
   <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
     <b style="font-size:13px">Watchdog</b>
     <div class="sub" style="margin:4px 0 8px">
-      Detects when the bridge stops delivering properly despite being
-      "connected", and escalates in up to three levels depending on the
-      symptom: <b>Ethernet link up, but no traffic from the camera</b>
-      &rarr; only the Ethernet driver is restarted (Wi-Fi stays untouched);
-      <b>Wi-Fi-side problems</b> (high loss rate, frequent reassociations,
-      failed gateway probe) &rarr; disconnect and reconnect Wi-Fi
-      (Ethernet/camera stay untouched); <b>if none of that helps</b> &rarr;
-      full reboot with a deliberate coredump, so the reason can be traced
-      afterwards. None of this counts as a failed boot for the boot-loop
-      protection.
+      Uses local link state and forwarding errors only. Quiet clients and
+      unplugged cables never trigger recovery. Wi-Fi disassociation requests
+      reconnects; sustained Ethernet transmit failures can restart Ethernet.
+      Persistent forwarding errors may escalate to a coredump reboot, limited
+      to two reboots until ten healthy minutes. Actions are at least a minute
+      apart. Local checks cannot prove end-to-end network reachability.
     </div>
     <select id="wd_enable">
       <option value="0">Off (default)</option>
@@ -736,7 +740,7 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     falls back to the previous version.
   </div>
   <input type="file" id="fw" accept=".bin">
-  <label>Admin key</label><input id="okey" type="password">
+  <label>Optional explicit key (browser login also works)</label><input id="okey" type="password">
   <div class="bar" style="margin-top:12px"><i id="pbar" style="width:0"></i></div>
   <button onclick="upload()">Upload &amp; flash</button>
   <div id="omsg"></div>
@@ -770,7 +774,7 @@ const TD=(t,h)=>'<'+(h?'th':'td')+' style="text-align:left;padding:2px 6px;borde
 /* esp_reset_reason_t -> plain text. 255 = imported from before the history existed. */
 const RST={4:'Crash (panic)',5:'Interrupt watchdog',6:'Task watchdog',7:'Hardware watchdog',9:'Brownout (voltage)',14:'Power glitch',15:'CPU lockup',255:'Crash (imported)'};
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-/* Load the crash history (admin key from the firmware field, if set). */
+/* Load crash history using the browser login or optional explicit key. */
 async function checkCrashes(){
   try{
     const r=await fetch('/api/crashes',{headers:cdHeaders()});
@@ -933,7 +937,7 @@ async function tick(){
       (s.wd_eth_resets ? ' &middot; Watchdog Ethernet resets: <b>'+s.wd_eth_resets+'</b>' : '')+
       (s.roam_count ? ' &middot; AP switches (roaming): <b>'+s.roam_count+'</b>' : '')+
       (s.wd_last_reason ? ' &middot; last watchdog reboot: <span class="bad">'+
-        (['','loss ratio','reconnects','gateway probe','no camera traffic'][s.wd_last_reason]||'?')+'</span>' : '')+
+        (['','loss ratio','reconnects','Wi-Fi disconnected','Ethernet transmit errors'][s.wd_last_reason]||'?')+'</span>' : '')+
       ' &middot; Heap: <b>'+Math.round(s.heap/1024)+' kB</b>'+
       (s.heap_min!==undefined
         ? ' (minimum '+Math.round(s.heap_min/1024)+' kB, DMA '+
@@ -946,7 +950,7 @@ async function tick(){
 /* One field name per entry, in exactly this order when saving too.
    Password fields are deliberately NOT part of load() - they never come
    back from the board; an empty field means "leave unchanged" on save. */
-const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','ip3','mask3','gw3',
+const CFG=['ip_profile','name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','ip3','mask3','gw3',
            'mqtt_host','mqtt_port','mqtt_user','telemetry_s',
            'tx_power','eth_tx_retries','wifi_tx_retries',
            'static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win',
@@ -1530,7 +1534,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
    * when adding fields. */
   char buf[2048];
   snprintf(buf, sizeof(buf),
-    "{\"name\":\"%s\",\"ssid1\":\"%s\",\"ssid2\":\"%s\",\"ssid3\":\"%s\","
+    "{\"ip_profile\":%u,\"name\":\"%s\",\"ssid1\":\"%s\",\"ssid2\":\"%s\",\"ssid3\":\"%s\","
     "\"ip\":\"%s\",\"mask\":\"%s\",\"gw\":\"%s\","
     "\"ip2\":\"%s\",\"mask2\":\"%s\",\"gw2\":\"%s\","
     "\"ip3\":\"%s\",\"mask3\":\"%s\",\"gw3\":\"%s\","
@@ -1552,7 +1556,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"wd_actions\":%u,\"wd_bad_windows\":%u},"
     "\"eff\":{\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u}}",
-    n, s1, s2, s3, ip, mask, gw, ip2, mask2, gw2, ip3, mask3, gw3,
+    (unsigned)(g_cfg.ip_profile <= 2 ? g_cfg.ip_profile : 0), n, s1, s2, s3, ip, mask, gw, ip2, mask2, gw2, ip3, mask3, gw3,
     mh, g_cfg.mqtt_port, mu, g_cfg.telemetry_s,
     /* Return the EFFECTIVE values, not the stored 0 - the form should show
      * what is running. On save the number is then stored explicitly; the
@@ -1620,6 +1624,13 @@ static esp_err_t h_config_post(httpd_req_t *r) {
    * would silently store a truncated 64-character password with a few
    * special characters. 3 x 64 + NUL covers the worst case. */
   char v[200];
+  if (form_get(body, "ip_profile", v, sizeof(v))) {
+    if (strlen(v) != 1 || v[0] < '0' || v[0] > '2') {
+      httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "invalid IP profile");
+      return ESP_FAIL;
+    }
+    g_cfg.ip_profile = v[0] - '0';
+  }
   if (form_get(body, "name",  v, sizeof(v))) strncpy(g_cfg.name,  v, sizeof(g_cfg.name)  - 1);
   if (form_get(body, "ssid1", v, sizeof(v))) strncpy(g_cfg.ssid1, v, sizeof(g_cfg.ssid1) - 1);
   if (form_get(body, "ssid2", v, sizeof(v))) strncpy(g_cfg.ssid2, v, sizeof(g_cfg.ssid2) - 1);
@@ -1979,15 +1990,51 @@ static esp_err_t h_scan(httpd_req_t *r) {
  * updates from the local network.
  * ========================================================================= */
 
-/* Minimal protection, shared by firmware update, coredump and crash history.
- * Over plain HTTP this is no real protection against someone sniffing the
- * traffic - but it prevents accidental flashing/reading and access from
- * devices that do not know the key. No admin_pass set = open. */
+/* Authenticate every route with HTTP Basic (browser login) or the header
+ * used by local OTA tools. An unset admin password uses the unique AP secret,
+ * never anonymous access. Only the precomputed session snapshot is compared. */
 static bool admin_key_ok(httpd_req_t *r) {
-  if (!g_cfg.admin_pass[0]) return true;
-  char key[48] = "";
-  return httpd_req_get_hdr_value_str(r, "X-Admin-Key", key, sizeof(key)) == ESP_OK &&
-         strcmp(key, g_cfg.admin_pass) == 0;
+  char key[96] = {};
+  if (httpd_req_get_hdr_value_str(r, "X-Admin-Key", key, sizeof(key)) == ESP_OK &&
+      provisioning_secret_equal(s_http_password, key)) return true;
+  if (httpd_req_get_hdr_value_str(r, "Authorization", key, sizeof(key)) != ESP_OK) return false;
+  return provisioning_secret_equal(s_http_basic, key);
+}
+
+/* Reject browser requests from other sites, including authenticated form
+ * posts. Command-line tools without browser provenance remain supported.
+ * Host and Origin must match exactly; HTTPS is not offered by this portal. */
+static bool same_origin_request(httpd_req_t *r) {
+  char site[32] = {};
+  if (httpd_req_get_hdr_value_len(r, "Sec-Fetch-Site")) {
+    if (httpd_req_get_hdr_value_str(r, "Sec-Fetch-Site", site, sizeof(site)) != ESP_OK) return false;
+    if (strcmp(site, "same-origin") && strcmp(site, "none")) return false;
+  }
+  if (!httpd_req_get_hdr_value_len(r, "Origin")) return true;
+  char host[80] = {}, origin[96] = {}, expected[96] = {};
+  if (httpd_req_get_hdr_value_str(r, "Host", host, sizeof(host)) != ESP_OK ||
+      httpd_req_get_hdr_value_str(r, "Origin", origin, sizeof(origin)) != ESP_OK) return false;
+  snprintf(expected, sizeof(expected), "http://%s", host);
+  return strcmp(origin, expected) == 0;
+}
+
+/* Single authentication boundary for root, configuration, diagnostics and
+ * OTA, including future registered routes. Do not execute a handler before
+ * authentication and origin checks; failed attempts never extend AP uptime. */
+static esp_err_t provisioning_dispatch(httpd_req_t *r) {
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  if (!s_provisioning || !admin_key_ok(r)) {
+    httpd_resp_set_hdr(r, "WWW-Authenticate", "Basic realm=\"Bridge setup\"");
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "authentication required");
+    return ESP_FAIL;
+  }
+  if (!same_origin_request(r)) {
+    httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "cross-origin request rejected");
+    return ESP_FAIL;
+  }
+  const httpd_uri_t *route = static_cast<const httpd_uri_t *>(r->user_ctx);
+  r->user_ctx = route->user_ctx;
+  return route->handler(r);
 }
 
 /* POST /api/update - stream the request body into the next OTA partition,
@@ -2434,6 +2481,17 @@ bool web_start(bool provisioning) {
     return false;
   }
   s_provisioning = true;
+  const char *secret = g_cfg.admin_pass[0] ? g_cfg.admin_pass : s_ap_password;
+  if (!secret[0] || strnlen(secret, sizeof(s_http_password)) >= sizeof(s_http_password)) return false;
+  strcpy(s_http_password, secret);
+  char plain[40];
+  snprintf(plain, sizeof(plain), "admin:%s", secret);
+  size_t encoded = 0;
+  strcpy(s_http_basic, "Basic ");
+  if (mbedtls_base64_encode((unsigned char *)s_http_basic + 6, sizeof(s_http_basic) - 6,
+      &encoded, (const unsigned char *)plain, strlen(plain)) != 0) return false;
+  s_http_basic[6 + encoded] = '\0';
+  memset(plain, 0, sizeof(plain));
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;
@@ -2461,7 +2519,7 @@ bool web_start(bool provisioning) {
     return false;
   }
 
-  const httpd_uri_t uris[] = {
+  static const httpd_uri_t uris[] = {
     { "/",            HTTP_GET,  h_root,        NULL },
     { "/api/status",  HTTP_GET,  h_status,      NULL },
     { "/api/disconnects",HTTP_GET,h_disconnects,NULL },
@@ -2488,7 +2546,13 @@ bool web_start(bool provisioning) {
 #endif
   };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-    httpd_register_uri_handler(s_httpd, &uris[i]);
+    httpd_uri_t route = uris[i];
+    route.handler = provisioning_dispatch;
+    route.user_ctx = (void *)&uris[i];
+    if (httpd_register_uri_handler(s_httpd, &route) != ESP_OK) {
+      httpd_stop(s_httpd); s_httpd = nullptr;
+      return false;
+    }
   }
 
   printf("[WEB ] HTTP server running\n");

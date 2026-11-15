@@ -2,6 +2,7 @@
 > two 1920 KB OTA slots). The original `wt32-eth01` environment remains 8 MB.
 > Read [the deployment guide](docs/content/wt32-deployment.md) before flashing:
 > HTTP/OTA is provisioning-only and the physical setup input preserves settings.
+> Setup now authenticates every route; see [local recovery and access](docs/content/local-recovery-and-access.md) for login, explicit IP profile selection and isolated telemetry.
 > Firmware runtime changes require hardware verification before unattended use.
 
 # ESP32 Wi-Fi Bridge on Steroids

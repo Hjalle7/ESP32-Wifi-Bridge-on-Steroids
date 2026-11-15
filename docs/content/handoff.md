@@ -4,7 +4,7 @@
 
 WT32-ETH01 is the first-choice hardware. The first implementation slice adds the default 4 MB build target and provisioning-only HTTP/OTA, removes NetBIOS/SNTP startup, and changes the physical GPIO gesture to non-destructive setup. Setup uses a persistent random AP credential shown only on local serial. OTA acceptance waits for 30 continuous seconds of local link readiness. See [wt32-deployment.md](wt32-deployment.md) for commissioning, migration and remaining work, and [implementation-design.md](implementation-design.md) for the full proposed architecture.
 
-No device tests have been performed. Watchdog/profile gateway ping, MQTT isolation, full provisioning API authentication and configuration validation still need implementation. The upstream snapshot below describes the prior deployed firmware and must not be read as validation of this fork's changes.
+No device tests have been performed. The follow-up implementation removes watchdog/profile gateway ping, adds explicit IP selection, bounds local recovery and isolates MQTT publishing. All HTTP routes share authentication/origin checks. See [local-recovery-and-access.md](local-recovery-and-access.md). Stronger configuration validation and remaining deployment acceptance are still open. The upstream snapshot below describes the prior deployed firmware and must not be read as validation of this fork's changes.
 
 ## State as of 2026-09-05
 

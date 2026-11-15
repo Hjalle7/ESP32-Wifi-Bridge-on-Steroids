@@ -197,6 +197,10 @@ struct BridgeConfig {
    * 81 degC at sustained full load, so a higher value (e.g. 90) keeps the
    * throttle as a guard against real overheating only. Live. */
   uint8_t  thr_temp_c;
+
+  /* Start beyond the legacy tail padding so short blobs cannot replace
+   * this default with padding bytes from the previous struct layout. */
+  alignas(uint32_t) uint8_t ip_profile; /* explicit IP profile: 0, 1 or 2 */
 };
 
 extern BridgeConfig g_cfg;

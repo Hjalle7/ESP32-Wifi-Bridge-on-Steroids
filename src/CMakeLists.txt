@@ -23,10 +23,11 @@ idf_component_register(
         bootloader_support   # temporary hardware entropy for setup secret
         esp_http_server      # portal and status API
         mqtt                 # telemetry
+        mbedtls              # provisioning HTTP Basic credential encoding
         app_update           # OTA (esp_ota_*)
         driver               # GPIO
         esp_hw_support
-        lwip                 # ping_sock.h - location detection via gateway ping
+        lwip                 # static telemetry IP stack
         espcoredump          # crash history (crashlog.cpp), /api/coredump
         spi_flash            # esp_flash_read - coredump fingerprint
 )

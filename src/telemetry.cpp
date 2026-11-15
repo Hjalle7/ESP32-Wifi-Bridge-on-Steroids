@@ -17,13 +17,27 @@
 #include "bridge.h"
 
 #include <string.h>
+#include <atomic>
+#include "freertos/queue.h"
 
 #include "mqtt_client.h"
 #include "esp_wifi.h"
 
 static esp_mqtt_client_handle_t s_mqtt = NULL;
-static bool  s_connected  = false;
-static bool  s_announced  = false;
+static std::atomic<bool> s_connected{false};
+static std::atomic<uint32_t> s_generation{0};
+/* Four pending messages plus a bounded MQTT outbox limit outage memory use.
+ * Producers copy messages without waiting; only the worker touches sockets. */
+struct TelemetryMessage {
+  char topic[160];
+  char payload[640];
+  int qos;
+  int retain;
+  uint32_t generation;
+};
+static QueueHandle_t s_queue = nullptr;
+static bool s_publish_ok = true;  /* worker-owned discovery batch result */
+static std::atomic<uint32_t> s_queue_drops{0};
 static char  s_node[16]   = "bridge";
 static char  s_base[48];
 static char  s_avail[64];
@@ -39,17 +53,50 @@ static void mqtt_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     case MQTT_EVENT_CONNECTED:
       s_connected = true;
       printf("[MQTT] Connected\n");
-      esp_mqtt_client_publish(s_mqtt, s_avail, "online", 0, 1, 1);
+      ++s_generation;
       break;
     case MQTT_EVENT_DISCONNECTED:
       s_connected = false;
-      s_announced = false;      /* announce again after reconnecting */
+
       printf("[MQTT] Disconnected\n");
       break;
     default:
       (void)e;
       break;
   }
+}
+
+/* Nonblocking producer boundary. Offline/full queues lose telemetry rather
+ * than delaying forwarding or watchdog recovery. Payloads must fit exactly. */
+static void queue_publish(const char *topic, const char *payload, int qos, int retain) {
+  if (!s_queue || !s_connected.load()) return;
+  TelemetryMessage message = {};
+  if (strlen(topic) >= sizeof(message.topic) || strlen(payload) >= sizeof(message.payload)) {
+    ++s_queue_drops;
+    return;
+  }
+  strcpy(message.topic, topic);
+  strcpy(message.payload, payload);
+  message.qos = qos; message.retain = retain;
+  message.generation = s_generation.load();
+  if (xQueueSend(s_queue, &message, 0) != pdTRUE) ++s_queue_drops;
+}
+
+/* Worker-only network operation. Outbox exhaustion is a telemetry failure,
+ * never a request for bridge recovery; discovery retries are paced. */
+static void worker_publish(const char *topic, const char *payload, int qos, int retain) {
+  if (!s_connected.load() || esp_mqtt_client_publish(s_mqtt, topic, payload, 0, qos, retain) < 0)
+    s_publish_ok = false;
+}
+
+static size_t s_discovery_cursor = 0, s_discovery_index = 0;
+
+/* Resume a failed discovery batch at its first unsent item. Replaying the
+ * prefix would starve later entries when broker ACKs slowly free outbox space. */
+static void discovery_publish(const char *topic, const char *payload, int qos, int retain) {
+  if (s_discovery_index++ != s_discovery_cursor) return;
+  worker_publish(topic, payload, qos, retain);
+  if (s_publish_ok) ++s_discovery_cursor;
 }
 
 /* Publish one Home Assistant sensor discovery entry (retained). `key` is the
@@ -78,7 +125,7 @@ static void announce_one(const char *key, const char *name, const char *unit,
     "\"mf\":\"DIY\",\"mdl\":\"WT32-ETH01 L2 Bridge\"}}",
     name, s_node, key, s_state, s_avail, key, extra, s_node, g_cfg.name);
 
-  esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 1);
+  discovery_publish(topic, payload, 1, 1);
 }
 
 /* Publish all discovery entries (sensors plus the Ethernet link binary
@@ -125,10 +172,41 @@ static void announce_all(void) {
     "\"dev_cla\":\"connectivity\","
     "\"dev\":{\"ids\":[\"bridge_%s\"],\"name\":\"%s\"}}",
     s_node, s_state, s_avail, s_node, g_cfg.name);
-  esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 1);
+  discovery_publish(topic, payload, 1, 1);
 
-  s_announced = true;
-  printf("[MQTT] Discovery sent\n");
+  if (s_publish_ok) printf("[MQTT] Discovery sent\n");
+}
+
+/* Own all socket-facing publishing. Reconnect generation ensures a fresh
+ * retained discovery/availability batch after each connection. Events queued
+ * before an outage are discarded, and recovery never waits for their ACKs. */
+static void telemetry_worker(void *) {
+  uint32_t announced_generation = 0, cursor_generation = 0;
+  bool availability_sent = false;
+  uint32_t last_discovery = 0;
+  bool attempted = false;
+  TelemetryMessage message;
+  for (;;) {
+    const uint32_t generation = s_generation.load();
+    if (s_connected.load() && generation != announced_generation &&
+        (!attempted || millis() - last_discovery >= 5000u)) {
+      attempted = true; last_discovery = millis(); s_publish_ok = true;
+      if (cursor_generation != generation) {
+        cursor_generation = generation;
+        s_discovery_cursor = 0;
+        availability_sent = false;
+      }
+      if (!availability_sent) {
+        worker_publish(s_avail, "online", 1, 1);
+        availability_sent = s_publish_ok;
+      }
+      if (s_publish_ok) { s_discovery_index = 0; announce_all(); }
+      if (s_publish_ok) announced_generation = generation;
+    }
+    if (xQueueReceive(s_queue, &message, pdMS_TO_TICKS(200)) == pdTRUE && s_connected.load() &&
+        message.generation == s_generation.load())
+      worker_publish(message.topic, message.payload, message.qos, message.retain);
+  }
 }
 
 /* See telemetry.h. Derives the node id and topics from the STA MAC (= the
@@ -158,22 +236,40 @@ bool telemetry_start(void) {
   cfg.session.last_will.qos           = 1;
   cfg.session.last_will.retain        = 1;
   cfg.session.keepalive               = 30;
+  cfg.network.timeout_ms             = 1000;
+  cfg.network.reconnect_timeout_ms   = 5000;
+  cfg.outbox.limit                   = 8192;
   if (g_cfg.mqtt_user[0]) {
     cfg.credentials.username                 = g_cfg.mqtt_user;
     cfg.credentials.authentication.password  = g_cfg.mqtt_pass;
   }
 
+  s_queue = xQueueCreate(4, sizeof(TelemetryMessage));
+  if (!s_queue) return false;
   s_mqtt = esp_mqtt_client_init(&cfg);
-  if (!s_mqtt) { printf("[MQTT] Init failed\n"); return false; }
+  if (!s_mqtt) {
+    vQueueDelete(s_queue); s_queue = nullptr;
+    printf("[MQTT] Init failed\n"); return false;
+  }
 
   esp_mqtt_client_register_event(s_mqtt, MQTT_EVENT_ANY, mqtt_evt, NULL);
-  esp_mqtt_client_start(s_mqtt);
+  if (esp_mqtt_client_start(s_mqtt) != ESP_OK) {
+    esp_mqtt_client_destroy(s_mqtt); s_mqtt = nullptr;
+    vQueueDelete(s_queue); s_queue = nullptr;
+    return false;
+  }
+  if (xTaskCreate(telemetry_worker, "telemetry", 6144, nullptr, 1, nullptr) != pdPASS) {
+    esp_mqtt_client_stop(s_mqtt); esp_mqtt_client_destroy(s_mqtt);
+    s_mqtt = nullptr; s_connected = false;
+    vQueueDelete(s_queue); s_queue = nullptr;
+    return false;
+  }
   printf("[MQTT] Connecting to %s\n", uri);
   return true;
 }
 
-/* See telemetry.h. Sends the discovery entries first if needed, then the
- * state JSON (QoS 0, not retained). */
+/* See telemetry.h. Format and queue state without any socket operations.
+ * Discovery and network waits belong exclusively to the publishing worker. */
 void telemetry_tick(void) {
   if (!s_mqtt || !s_connected) return;
 
@@ -182,7 +278,6 @@ void telemetry_tick(void) {
   if (millis() - last < interval) return;
   last = millis();
 
-  if (!s_announced) announce_all();
 
   BridgeStats st;
   bridge_get_stats(&st);
@@ -193,7 +288,7 @@ void telemetry_tick(void) {
     "\"pkt_up\":%lu,\"pkt_down\":%lu,\"drop_up\":%lu,\"drop_down\":%lu,"
     "\"wifi_disc\":%lu,\"wifi_kicks\":%lu,\"disc_reason\":\"%s\","
     "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"roam_count\":%lu,"
-    "\"eth\":%d,\"uptime\":%lu,\"heap\":%lu,\"bssid\":\"%s\","
+    "\"telemetry_drops\":%lu,\"eth\":%d,\"uptime\":%lu,\"heap\":%lu,\"bssid\":\"%s\","
     "\"client_ip\":\"%s\",\"txq_ms\":%lu,\"air_fail\":%lu}",
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -202,11 +297,11 @@ void telemetry_tick(void) {
     (unsigned long)st.wifi_disc_count, (unsigned long)st.wifi_kicks,
     st.disc_last_reason ? bridge_wifi_reason_str(st.disc_last_reason) : "-",
     (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets, (unsigned long)st.roam_count,
-    st.eth_link ? 1 : 0, (unsigned long)(millis() / 1000),
+    (unsigned long)s_queue_drops.load(), st.eth_link ? 1 : 0, (unsigned long)(millis() / 1000),
     (unsigned long)esp_get_free_heap_size(), st.bssid, st.client_ip,
     (unsigned long)st.txq_delay_ms, (unsigned long)st.air_fail);
 
-  esp_mqtt_client_publish(s_mqtt, s_state, payload, 0, 0, 0);
+  queue_publish(s_state, payload, 0, 0);
 }
 
 /* See telemetry.h. */
@@ -220,10 +315,7 @@ void telemetry_note_watchdog_event(const char *action, const char *reason) {
   snprintf(payload, sizeof(payload), "{\"action\":\"%s\",\"reason\":\"%s\",\"uptime\":%lu}",
            action, reason ? reason : "", (unsigned long)(millis() / 1000));
 
-  /* QoS 1, not retained - an event, not a persistent state. Called
-   * synchronously from the watchdog escalation (also right before a forced
-   * reboot) - esp_mqtt_client_publish() itself returns immediately, so the
-   * caller has to wait briefly for it to go out, see watchdog_tick() in
-   * bridge.cpp. */
-  esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
+  /* Best-effort event: a reboot may discard it. Local recovery must never
+   * delay for MQTT transmission or acknowledgement. */
+  queue_publish(topic, payload, 1, 0);
 }

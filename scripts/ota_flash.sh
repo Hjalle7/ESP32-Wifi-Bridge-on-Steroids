@@ -8,7 +8,7 @@
 # longer be resolved reliably - addr2line against a different build only
 # yields meaningless matches.
 #
-# Usage: scripts/ota_flash.sh <ip> [admin-key] [pio-env]
+# Usage: scripts/ota_flash.sh <ip> <admin-key> [pio-env]
 #
 # pio-env defaults to wt32-eth01-4mb; pass nicemcu-c5-w5500 for the ESP32-C5
 # board. The portal must be entered physically before uploading. A first
@@ -18,9 +18,9 @@
 
 set -euo pipefail
 
-USAGE="Usage: scripts/ota_flash.sh <ip> [admin-key] [pio-env]"
+USAGE="Usage: scripts/ota_flash.sh <ip> <admin-key> [pio-env]"
 IP="${1:?$USAGE}"
-KEY="${2:-}"
+KEY="${2:?$USAGE}"
 ENV="${3:-wt32-eth01-4mb}"
 
 cd "$(dirname "$0")/.."

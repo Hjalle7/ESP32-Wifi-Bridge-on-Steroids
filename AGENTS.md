@@ -151,17 +151,17 @@ TX power is quantized by the PHY to 11 discrete steps (2/5/7/8.5/11/13/14/15/16.
 
 ### Web portal (`web.cpp`)
 
-Single self-contained HTML/CSS/JS page (`PAGE[]`) served at `/`, plus a small JSON API (`/api/status`, `/api/config` GET/POST, `/api/scan`, `/api/reboot`, `/api/update`). Config POST uses hand-rolled form-urlencoded parsing (`form_get`) — empty password fields mean "leave unchanged", not "clear". `/api/update` streams a raw `.bin` directly into the inactive OTA partition (`esp_ota_*`), gated by an optional `X-Admin-Key` header checked against `admin_pass`; there's no TLS (originally rejected for the ~40 KB of flash it costs on the believed-2 MB layout). Note that the admin key only guards `/api/update` and `/api/coredump` — `/api/config` POST (including changing `admin_pass` itself) and `/api/reboot` are unauthenticated.
+Single self-contained HTML/CSS/JS page (`PAGE[]`) served at `/`, plus a small JSON API (`/api/status`, `/api/config` GET/POST, `/api/scan`, `/api/reboot`, `/api/update`). Config POST uses hand-rolled form-urlencoded parsing (`form_get`) — empty password fields mean "leave unchanged", not "clear". `/api/update` streams a raw `.bin` directly into the inactive OTA partition (`esp_ota_*`), gated by the shared Basic-login or `X-Admin-Key` authentication boundary; there's no TLS (originally rejected for the ~40 KB of flash it costs on the believed-2 MB layout). All registered routes now require authentication; HTTP exists only in provisioning.
 
 The "Console log" box in the portal shows the serial console over the network: `conlog.cpp` swaps `stdout` for a `funopen()` stream at the very start of `app_main()` (tasks inherit `stdout` from `_GLOBAL_REENT` when created, so it must come first), keeps the last 8 KB in a ring buffer and still forwards everything to the real console. `GET /api/log?since=N` returns up to 2 KB from byte position `N`, with `X-Log-Next` for the next poll and `X-Log-Reset: 1` after a reboot or ring wrap; it is guarded by the admin key like the other diagnostics. Only `printf`/`ESP_LOG` output is captured — ROM and bootloader output (`esp_rom_printf`) never goes through `stdout`.
 
-The provisioning AP uses a persisted per-device random password printed directly to local serial, bypassing the web log ring. Capture it before deployment. Provisioning API authentication is still incomplete; physical setup is not yet a production security boundary.
+The provisioning AP uses a persisted per-device random password printed directly to local serial, bypassing the web log ring. Capture it before deployment. Every HTTP route uses the shared authentication/origin dispatcher: browser Basic login as admin, or X-Admin-Key for tools, with the saved admin password or unique AP secret. Empty admin password never means anonymous access. The credential snapshot changes only at the next setup boot.
 
-OTA from the command line (provisioning only): `scripts/ota_flash.sh <ip> [admin-key] [pio-env]` (env defaults to `wt32-eth01-4mb`) builds, archives the matching `firmware.elf` under `elf_archive/` and uploads.
+OTA from the command line (provisioning only): `scripts/ota_flash.sh <ip> <admin-key> [pio-env]` (env defaults to `wt32-eth01-4mb`) builds, archives the matching `firmware.elf` under `elf_archive/` and uploads.
 
 ### Telemetry (`telemetry.cpp`)
 
-Optional MQTT client (only starts if `mqtt_host` is configured), publishes state to `bridge/<mac-suffix>/state` and does Home Assistant MQTT autodiscovery (`homeassistant/sensor/.../config`) on (re)connect.
+Optional MQTT client (only starts if `mqtt_host` is configured), uses a four-message zero-wait producer queue and a dedicated publishing task with an 8192-byte outbox limit. It publishes state to `bridge/<mac-suffix>/state` and does Home Assistant MQTT autodiscovery (`homeassistant/sensor/.../config`) on (re)connect.
 
 ### Partition layout
 
@@ -183,3 +183,7 @@ W5500 specifics that matter for the data path:
 - The C5 is single-core, so Wi-Fi, the W5500 task and lwIP share one CPU. Don't expect WT32-EMAC numbers without measuring.
 - Power: the NiceMCU module's LDO also feeds the W5500 and resets the board under sustained LAN -> Wi-Fi load (>~12 Mbit/s; heat in the regulator, it lags the SoC temperature). `thermal_tick()` in `bridge.cpp` throttles LAN -> Wi-Fi from the SoC temperature (`cpustat_temp_x10()`, `thr_off`) and to a fixed cap (`e2w_max_mbit`), enforced by a token bucket in `eth_rx_cb()`. Load tests that end in power-on resets are a hardware symptom, not a firmware bug - check `rst`/`rtc` and the crash history before debugging code, and remember that a reset within 30 s of an OTA rolls the image back.
 - The C5's LP core cannot help the data path: it has no access to the Wi-Fi driver or SPI2 and only reaches LP GPIOs IO0–IO6.
+
+## Local recovery and access implementation
+
+Read [local-recovery-and-access.md](docs/content/local-recovery-and-access.md) for implemented behavior, authentication, explicit IP profile selection, bounded local recovery, MQTT memory limits and host tests. Gateway probing is removed. Quiet traffic/cable removal are not failures; Wi-Fi disassociation alone never causes a board reboot. Device acceptance is still required.
