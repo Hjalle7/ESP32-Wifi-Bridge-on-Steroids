@@ -1,176 +1,84 @@
-# AGENTS.md
-
-Instructions for AI assistants and contributors working in this repository. Read this file before making changes.
-
-
-## Planned direction for this fork
-
-The following requirements describe the agreed target, not features already implemented. The architecture sections below document the current firmware; where they differ, use this section to guide new work. Extend the existing implementation rather than rewriting it.
-
-### Normal bridge operation
-
-- Preserve transparent Ethernet–Wi-Fi layer-2 bridging and client MAC cloning. The Ethernet client remains in the existing IoT VLAN and IP subnet, with DHCP supplied by the existing router. Do not introduce NAT, a separate subnet, or a WDS requirement.
-- Keep a separate static IPv4 address on the ESP32 for outbound MQTT telemetry and its required reply traffic. It must not conflict with the Ethernet client's address or the DHCP pool. IPv6 is not used in the target VLAN.
-- Run no HTTP server, administration API, or other listening management service in normal operation. Removing the web server must not remove the IP stack needed for MQTT.
-- MQTT is telemetry only: no command subscriptions or remote-control features. MQTT failures and reconnects must not block or degrade bridging.
-- Make watchdog detection and recovery local, independent of gateway ping, DNS, MQTT, or other IP communication. Preserve staged recovery and distinguish an idle client from a failed link.
-
-### Provisioning and configuration
-
-- Provide an explicit way to enter the setup AP and web portal without a factory reset, preserving saved settings. Keep factory reset a separate deliberate action.
-- Allow editing Wi-Fi credentials, static IPv4 address, netmask, gateway, DNS server, MQTT broker, port, and credentials in provisioning mode.
-- Start the web server and administrative endpoints only in provisioning mode. Use a unique strong AP password; do not retain the shared default password.
-- Validate configuration before saving and preserve backward compatibility with existing NVS blobs. The append-only BridgeConfig layout contract remains binding.
-- Decide the physical entry sequence, reboot-persistent provisioning request, timeout, return to normal operation, and whether bridging continues during provisioning before implementing them.
-- Decide whether firmware updates use provisioning-only OTA, USB, or both. Preserve OTA rollback and define its confirmation criteria for the revised modes.
-
-### Design questions to resolve
-
-- Preserve correct ARP and IPv4 delivery with the cloned MAC shared by the Ethernet client and the ESP32's distinct static address. Do not consume packets intended for the client.
-- Replace ping-based location detection separately from watchdog probing; profiles may share an SSID.
-- Isolate MQTT publishing and reconnect handling from the forwarding path, including broker outages.
-- Evaluate MQTT TLS, certificate handling, and broker authentication. Use broker ACLs appropriate for telemetry and Home Assistant discovery.
-- Define router rules restricting ESP32-originated traffic to required services without breaking the bridged client's traffic.
-- Review secret storage, Secure Boot, and Flash Encryption before production deployment.
-- BRIDGE_MINIMAL is a measurement/rollback variant without MQTT, not the target production configuration.
-
-### Implementation order and validation
-
-1. Complete read-only mapping of network interfaces, frame routing, MQTT, watchdog, provisioning, NVS, and both build targets.
-2. Design the STA IPv4/MQTT path and the normal/provisioning mode lifecycle.
-3. Restrict the web server and administrative endpoints to provisioning.
-4. Replace watchdog gateway probing with local indicators and validate staged recovery.
-5. Replace ping-based profile selection.
-6. Verify outbound-only MQTT and non-blocking failure handling.
-7. Add validated static IPv4/DNS configuration with backward-compatible persistence.
-8. Build the affected WT32-ETH01 and ESP32-C5/W5500 configurations.
-9. On hardware, verify DHCP/ARP, bidirectional traffic and Modbus TCP, MAC cloning after reboot/client replacement, provisioning without data loss, recovery/OTA, broker outages, and long-term stability.
-
-Use a separate branch for changes; leave main unchanged until review and merge. Record actual implementation status in docs/content/handoff.md and open work in docs/content/backlog.md. Do not describe planned behavior as verified. Throughput remains settled unless new evidence justifies investigation.
-
-## What this is
-
-An ESP32 firmware that turns a WT32-ETH01 board (ESP32-D0WD + LAN8720A PHY) into a transparent Wi-Fi↔Ethernet L2 bridge with MAC cloning: a device plugged into the Ethernet port (e.g. an IP camera) gets bridged onto a Wi-Fi network as if it were directly connected, while a separate static management IP on the same interface serves a config portal, a status API, and MQTT telemetry.
-
-Pure ESP-IDF via PlatformIO (`framework = espidf`) — no Arduino. The project used to be a dual `arduino, espidf` build; Arduino was removed deliberately because it transitively pulled in the ESP RainMaker/Insights components through the IDF Component Manager (unused, cost flash, caused recurring `esp_crt_bundle.h` / certificate build failures). `compat.h` provides just `millis()`/`delay()` over `esp_timer`/`vTaskDelay` so the original Arduino-style code didn't need a full rewrite.
-
-## Commands
-
-**On the original development machine, use `~/.pio-py313/bin/pio`, not plain `pio`.** See "Toolchain" below. On other machines, use an available compatible PlatformIO environment; do not assume this local path exists.
-
-```bash
-~/.pio-py313/bin/pio run -e wt32-eth01                 # build
-~/.pio-py313/bin/pio run -e wt32-eth01 -t upload       # flash
-~/.pio-py313/bin/pio run -e wt32-eth01 -t monitor      # serial monitor (115200, esp32_exception_decoder)
-~/.pio-py313/bin/pio run -t clean                      # clean build artifacts
-```
-
-Always pass the port explicitly (`--upload-port /dev/cu.usbserial-XXX`): a second USB-serial adapter for an unrelated board is often plugged in, and auto-detect could flash the wrong device.
-
-### Toolchain: PlatformIO must run on Python ≤ 3.13
-
-The pioarduino `platform-espressif32` rejects Python ≥ 3.14 outright in its `platform.py`. Homebrew's `pio` runs on `python@3.14` **and recreates `~/.platformio/penv` with `uv` whenever it runs**, so fixing that venv in place does not stick. The working setup is a standalone venv at `~/.pio-py313` (Python 3.13) containing `platformio==6.1.19` **and `pyyaml`** — PyYAML is not a PlatformIO dependency, but the platform's `component_manager.py` imports it. It shares the `~/.platformio` core dir, so toolchains aren't duplicated.
-
-Moving `~/.platformio/platforms/espressif32` out of the way does *not* work as a dodge: PlatformIO re-downloads it from the URL in `platformio.ini`, and the current release carries the same check.
-
-There are two environments, built from the same sources; no separate test suite (this is embedded firmware — verification is build success + on-device serial log behavior):
-
-- `wt32-eth01` — ESP32 + internal EMAC + LAN8720A (the original target, 8 MB flash).
-- `nicemcu-c5-w5500` — NiceMCU ESP32-C5_MINI_V1.0 (ESP32-C5HF4: single-core RISC-V, dual-band Wi-Fi 6, 4 MB in-package flash, no PSRAM, native USB) + a W5500 over SPI. See "Second target" below. Flash and monitor over the board's USB-C port (`/dev/cu.usbmodem*`).
-
-### Flash budget
-
-The board has **8 MB** of flash — measured at the chip on 2026-08-13 (`esptool flash-id` → Zbit `0x5E`/`0x4017`, capacity byte `0x17` = 8 MiB, cross-checked with an aliasing read at `0x401000`). Earlier project notes claiming 2 MB were wrong, and `partitions_2mb_ota.csv` is the obsolete leftover from that belief; the live layout is `partitions_8mb_ota.csv` (2 × 3 MB OTA slots + a 64 KB coredump partition). Current usage is ~26% of a slot, so flash pressure is no longer a real constraint.
-
-Note the asymmetry if you ever change the size again: `esp_flash_init_default_chip()` **fails hard** when the detected chip is *smaller* than the image header claims, but only *warns* (and wastes capacity) when it's larger. Too-big headers brick the boot; too-small ones just cost space. After a build, check the `Flash:` percentage in the `pio run` output. If a change pushes it over 100%, the fix is almost never "trim comments" — check `CONFIG_COMPILER_OPTIMIZATION_SIZE` is still `y` (not `PERF`) and that nothing new is `REQUIRES`d in `src/CMakeLists.txt` that isn't actually needed.
-
-Don't guess at what's consuming flash — measure it. `xtensa-esp-elf-gcc-nm --print-size --size-sort --radix=d .pio/build/wt32-eth01/firmware.elf | tail -30` lists the biggest symbols and has repeatedly pointed at whole subsystems that were linked but unused. `docs/content/backlog.md` records which further savings were evaluated and rejected, and why — read it before re-attempting one.
-
-### Flash size is configured in two independent places
-
-`board_build.flash_size` sets `CONFIG_ESPTOOLPY_FLASHSIZE` (what ESP-IDF believes); `board_upload.flash_size` sets the size nibble in the image header that esptool writes (what the hardware acts on). Both must say `8MB`. If only the first is set, the header silently inherits 4 MB from the `esp32dev` board manifest and the board never sees half of its flash (header < chip only warns). The reverse — a header claiming *more* than the chip has — makes `esp_flash_init_default_chip()` fail with `ESP_ERR_FLASH_SIZE_NOT_MATCH` ("Probe failed"), a hard error, so the board never boots. Verify with the first 4 bytes of `firmware.bin`/`bootloader.bin` rather than trusting sdkconfig.
-
-The same split applies to flash *frequency*: `CONFIG_ESPTOOLPY_FLASHFREQ` may still read `40m` in the generated sdkconfig while the actual header says 80 MHz, because PlatformIO patches it in at esptool time. The header wins — check there.
-
-### sdkconfig drift
-
-`sdkconfig.wt32-eth01` is a generated, fully-resolved cache of `sdkconfig.defaults` + component Kconfig defaults. PlatformIO/ESP-IDF only fills in options *missing* from it — an explicit value already present (e.g. from a previous build with different settings) silently wins over a later change to `sdkconfig.defaults`. If build behavior doesn't match what `sdkconfig.defaults` says it should (wrong flash size, unexpectedly large binary, a Kconfig-gated header suddenly missing), suspect drift first: delete `sdkconfig.wt32-eth01` and let it regenerate from `sdkconfig.defaults` on the next `pio run`, rather than hand-editing the cached file.
-
-## Language and comment conventions
-
-These rules are binding for every change, in every file (C/C++, headers, CMake, `platformio.ini`, `sdkconfig.defaults`, partition tables, scripts):
-
-- **English only.** All code comments, identifiers, serial log messages, MQTT/Home Assistant names, API error strings and the entire web portal UI (`PAGE[]` in `web.cpp`: labels, hints, buttons, status texts, JS messages) are English. No German anywhere in the code base. New text in `docs/content/` is English as well; `history.md` is append-only, so its existing (partly German) entries are not rewritten.
-- **Every function gets a comment** explaining what it does, how it works and why it exists — written so that someone new to the project can follow it without reading the git log. Non-obvious constraints (buffer ownership, IRAM, task context, ordering requirements) belong there.
-- **Comments describe the code as it is, not how it got there.** No dates, no incident narratives ("seen on 2026-08-14 in the lab"), no "previously this was X", no "I first tried …", no field-appended-on markers. Keep the *reason* a design decision was made (e.g. "retries default to 8 because dropped UDP frames are lost for good"), drop the story. History belongs in `docs/content/history.md`, open work in `docs/content/backlog.md`.
-- **Nothing personal in the code**: no personal names, home/lab locations, specific personal devices, private network details. Use neutral wording ("the bridged client", "an IP camera", "a second site").
-
-## Current implementation architecture
-
-### Entry point and lifecycle
-
-`src/main.cpp`'s `app_main()` calls `bridge_setup()` once then loops `bridge_loop()` forever — the direct ESP-IDF replacement for Arduino's `setup()`/`loop()`. Two mutually exclusive modes, decided at boot:
-
-- **Provisioning mode**: no Wi-Fi credentials stored, or the factory-reset GPIO (IO14, pulled low for 2s) was held at boot, or no Ethernet client was seen within `MAC_SNIFF_TIMEOUT_MS`. Starts an AP (`web.cpp: portal_start_ap()`) plus the HTTP portal, and does nothing else — Ethernet bridging is not attempted.
-- **Bridge mode**: Ethernet client MAC is sniffed, Wi-Fi STA connects using that *cloned* MAC, then the data path is activated and the HTTP server + MQTT telemetry start on the management IP.
-
-OTA rollback confirmation (`ota_confirm_if_pending()`) is deliberately gated on "reachable over the network for 30s", not "booted" — the board has no serial access once deployed, so a boot that succeeds but leaves networking broken must still roll back.
-
-### The bridge data path (`bridge.cpp`)
-
-This is the part that requires the most care when touched. `esp_wifi_internal_reg_rxcb()` has exactly one callback slot per interface, and lwIP normally owns it. `bridge_wifi_start()` re-registers it with `wifi_rx_cb()`, taking over frame delivery entirely:
-
-- **Ethernet → Wi-Fi** (`eth_rx_cb`): every frame goes straight to `esp_wifi_internal_tx()` on `WIFI_IF_STA`. No IP stack involved.
-- **Wi-Fi → Ethernet or management stack** (`wifi_rx_cb`): `is_for_mgmt()` inspects the raw frame (IPv4 dest or ARP target == the configured management IP) and routes matching frames to `esp_netif_receive()` on the management netif; everything else goes straight to `esp_eth_transmit()`. Broadcast/multicast IPv4 is intentionally *not* treated as management traffic — it only goes to the bridged client.
-
-Both directions free their buffers in every code path exactly once — that ownership contract is the main thing to preserve when editing this file. `bridge_set_paused()` stops forwarding (used during OTA flash writes, when the cache is briefly unavailable) without tearing down the drivers, so the management connection driving the OTA upload itself stays alive.
-
-The Wi-Fi STA and the management netif share one physical interface and MAC (the cloned client MAC) but have different IPs; ARP resolves both to the same MAC, which is what makes this transparent to switches/APs. The management IP **must** stay static — DHCP would hand the same MAC two different leases.
-
-### Config (`config.cpp` / `config.h`)
-
-`BridgeConfig` is stored as a single NVS blob (magic-prefixed). `cfg_load()` accepts blobs shorter than `sizeof(BridgeConfig)` (from older firmware) and leaves new fields at their defaults — this only works because new fields are **appended only**, never inserted in the middle (see the comment in `config.h`). Preserve that ordering discipline when adding config fields.
-
-The performance-tuning fields at the end of the struct follow a deliberate convention: **`0` means "don't override — use the sdkconfig / PHY default"**, so `sdkconfig.defaults` stays the single source of truth for baseline values and the portal only overrides what someone explicitly set. Don't put real numbers in `cfg_defaults()` for those fields; that would recreate the duplicate-source-of-truth bug that made sdkconfig buffer changes silently ineffective.
-
-### Runtime tuning split
-
-Tuning settings divide into two groups, and the portal labels them as such:
-
-- **Live** (`bridge_apply_live_tuning()`, no reboot): TX power and the two TX retry counters. TX power must be applied *after* `esp_wifi_start()` — earlier calls return `ESP_ERR_WIFI_NOT_STARTED`, which is why the call sits inside the connect loop rather than with the other Wi-Fi setup.
-- **Reboot required**: Wi-Fi buffer counts and RX BA window (they go into `wifi_init_config_t` at `esp_wifi_init()`), plus HT40 and the 802.11b toggle (must be set before connecting).
-
-TX power is quantized by the PHY to 11 discrete steps (2/5/7/8.5/11/13/14/15/16.5/18/20 dBm) — the portal offers exactly those as a dropdown, and `/api/status` reports the driver's *actual* value (`txp`, in 0.25 dBm units) rather than the requested one.
-
-### Web portal (`web.cpp`)
-
-Single self-contained HTML/CSS/JS page (`PAGE[]`) served at `/`, plus a small JSON API (`/api/status`, `/api/config` GET/POST, `/api/scan`, `/api/reboot`, `/api/update`). Config POST uses hand-rolled form-urlencoded parsing (`form_get`) — empty password fields mean "leave unchanged", not "clear". `/api/update` streams a raw `.bin` directly into the inactive OTA partition (`esp_ota_*`), gated by an optional `X-Admin-Key` header checked against `admin_pass`; there's no TLS (originally rejected for the ~40 KB of flash it costs on the believed-2 MB layout). Note that the admin key only guards `/api/update` and `/api/coredump` — `/api/config` POST (including changing `admin_pass` itself) and `/api/reboot` are unauthenticated.
-
-The "Console log" box in the portal shows the serial console over the network: `conlog.cpp` swaps `stdout` for a `funopen()` stream at the very start of `app_main()` (tasks inherit `stdout` from `_GLOBAL_REENT` when created, so it must come first), keeps the last 8 KB in a ring buffer and still forwards everything to the real console. `GET /api/log?since=N` returns up to 2 KB from byte position `N`, with `X-Log-Next` for the next poll and `X-Log-Reset: 1` after a reboot or ring wrap; it is guarded by the admin key like the other diagnostics. Only `printf`/`ESP_LOG` output is captured — ROM and bootloader output (`esp_rom_printf`) never goes through `stdout`.
-
-OTA from the command line: `scripts/ota_flash.sh <ip> [admin-key] [pio-env]` (env defaults to `wt32-eth01`) builds, archives the matching `firmware.elf` under `elf_archive/` and uploads.
-
-### Telemetry (`telemetry.cpp`)
-
-Optional MQTT client (only starts if `mqtt_host` is configured), publishes state to `bridge/<mac-suffix>/state` and does Home Assistant MQTT autodiscovery (`homeassistant/sensor/.../config`) on (re)connect.
-
-### Partition layout
-
-`partitions_8mb_ota.csv` is the live table: 24 KB NVS, 8 KB otadata, two 3 MB OTA app slots, a 64 KB coredump partition, ~1.8 MB unallocated reserve. The partition table cannot be changed via OTA, hence the generous slots. App partitions must start on 64 KB boundaries, hence the gap after otadata. (`partitions_2mb_ota.csv` is the obsolete leftover from the mistaken 2 MB belief — not referenced by the build.)
-
-### Second target: ESP32-C5 + W5500 (`nicemcu-c5-w5500`)
-
-Target differences are compile-time switches, not a fork: `CONFIG_ETH_USE_ESP32_EMAC` vs `CONFIG_ETH_SPI_ETHERNET_W5500` (Ethernet init and pins in `bridge.cpp`), `CONFIG_SOC_WIFI_SUPPORT_5G` (dual-band: `esp_wifi_set_band_mode(AUTO)` + the plural `esp_wifi_set_protocols`/`_bandwidths`, because the singular APIs return `ESP_ERR_NOT_SUPPORTED` in auto-band mode), `CONFIG_IDF_TARGET_ESP32C5` (factory-reset pin IO4) and `CONFIG_IDF_TARGET_ARCH_XTENSA` (`/api/coredump` and `crashlog.cpp`: RISC-V has no on-device backtrace, so `ra`/`mcause`/`mtval` are reported instead). C5-only Kconfig lives in `sdkconfig.defaults.esp32c5`, which ESP-IDF loads automatically on top of `sdkconfig.defaults` for that target; partitions are `partitions_4mb_ota.csv` (2 × 1920 KB). The generated cache is `sdkconfig.nicemcu-c5-w5500` — the drift rules above apply to it too.
-
-Wiring: SCLK IO9, MOSI IO8, MISO IO2, CS IO10, INT IO12, RST IO3. SCLK/MOSI are not the SPI2 IO_MUX pins (IO6/IO7), so the bus runs through the GPIO matrix; at 80 MHz MISO then arrives too late to be sampled in the same clock (see below). IO2 is a strapping pin but harmless as MISO; IO3 is JTAG MTDI, not a strapping pin. INT is on UART0 RX (IO12) so both boards solder together as one block; UART0 is unused (USB console), IO12 is not a strapping pin, and the W5500 holding INT low during a C5 reset does not affect booting. INT is not the cause of esptool's failing auto-reset over USB: with INT on IO15, `esptool chip-id` failed the same way with "No serial data received" and left the board hung until a power cycle (`--before no-reset` and `usb-reset` don't revive it either) - so deploy by OTA. The real cause is unknown. The console is USB-Serial/JTAG only (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`); on macOS it delivers output only while the host asserts DTR, so a reader opened with DTR=0 sees nothing. The BOOT button (IO28) can't be the factory reset: held at reset it enters download mode.
-
-W5500 specifics that matter for the data path:
-- The IDF W5500 driver sets "block multicast" in MACRAW mode; `eth_set_bridge_filters()` clears it via `ETH_CMD_S_ALL_MULTICAST` alongside promiscuous. Every place that (re)starts the driver calls it.
-- 80 MHz SPI is the W5500's *theoretical* maximum; only 33.3 MHz is guaranteed. `bridge_eth_init()` walks `W5500_SPI_STEPS` until the chip-version check passes: 80 MHz in **half-duplex with `input_delay_ns`** first, then plain 80 → 53.3 → 40 → 20 MHz (divisors of the 160 MHz SPI clock source). Plain full-duplex 80 MHz fails the check on the reference wiring; in half-duplex the IDF SPI driver puts one dummy clock before each read phase (input delay ≥ 12 ns at 80 MHz = one clock) and samples a clock later, which reads correctly. That is the only compensation on the C5 - `spi_ll_set_miso_delay()` is empty there, and dummy clocks are only applied in half-duplex mode (`spi_hal_setup_trans()`), which is why the driver issues reads as MISO-only transactions when the device is half-duplex. The version check only catches gross failures - the SPI link has no checksum, so marginal bit errors would show up as RX resyncs (`w5[2]`), TCP retransmissions or corrupted UDP payloads; if they do, remove the compensated step.
-- The MAC driver is our own (`src/w5500_mac.c`, derived from IDF's `esp_eth_mac_w5500.c`; IDF's W5500 *PHY* driver and config structs are still used). IDF's version waits for SEND_OK inside `transmit()` - i.e. inside `wifi_rx_cb` - and spends ~10 SPI transactions per sent and ~9 per received frame. Ours: `transmit()` only copies into a packed 16 KB byte ring (4-byte length header per entry; it must hold a whole A-MPDU burst, because the Wi-Fi task at priority 23 hands over up to the BA window of frames before the driver task runs - 16 fixed slots overflowed, mostly on TCP ACKs); the driver task writes the next frame into TX memory while the previous one is still on the wire (~4 transactions per frame); reception is one chain of queued SPI transactions per round (see the next point); transfers > 64 B wait for the SPI interrupt so the single core stays free for Wi-Fi; INTLEVEL is ~7 us instead of ~1.75 ms. Constraints when touching it: the SPI bus must be initialized with `max_transfer_sz = W5500_MAC_MAX_TRANSFER` (the 4092-byte default makes large RX reads fail with `ESP_ERR_INVALID_ARG` - the driver caps its batches to the bus limit, but smaller batches cost throughput); the INT line is mandatory (no poll mode); never issue a SEND before the previous SEND_OK. Its counters are `w5` in `/api/status` (drops: TX ring full, SEND timeout, RX resync, RX no heap; then incomplete RX rounds, not a drop). An RX round that finds only a frame still being stored waits 30 us, never a scheduler tick - `CONFIG_FREERTOS_HZ` is 100, so `vTaskDelay(1)` is 10 ms.
-- RX chain (`rx_fetch()`): per 3 KB piece a read, an `Sn_RX_RD` write and a RECV, then a read of RSR+RD that gives the next round its size (`rx_rsr`). The release is byte-granular - a cut-off frame head is kept in `rx_buf[rx_base, +rx_have)`, already released on the chip. Rules: while transactions are queued (`rx_inflight`, `spi_lock` held) nothing may issue a polled SPI transaction - `w5500_mac_pump_tx()` returns false then if a producer is blocked, and `eth_tx_retry_wait()` stops waiting; frames are delivered during the chain only while the TX ring is empty and no producer waits (`rx_may_deliver()`), the last piece's frames are carried into the next round; the SPI device queue must hold `RX_CHAIN_MAX` (the driver raises `queue_size`); the task loop must invalidate `rx_rsr` whenever it clears Sn_IR itself. The chain is capped at 8 KB (`W5500_MAC_MAX_TRANSFER`) and at 6 KB while TX frames wait - longer chains cost heap under bidirectional load. Loss from RX memory overflow is invisible on the chip: compare the sender's interface counter with `w5x[0]` (`burst.py`-style tests: N back-to-back full frames, then a pause).
-- `transmit()` waits up to 20 ms for TX ring room instead of dropping (A-MPDU bursts exceed the 16 KB ring); that wait runs in the Wi-Fi task. Anything that makes the W5500 driver task wait on Wi-Fi - the retry loop in `eth_rx_cb()` - must keep calling `w5500_mac_pump_tx()`, or the two tasks wait on each other until a timeout (seen as a download collapse to ~5 Mbit/s with `eth_tx_retries` > 3).
-- Throughput on this target is set by the SPI path, not the radio: next to the AP (-17 dBm) the bridge was exactly as fast as at -55 dBm, while 80 MHz instead of 53 MHz gave +15-19 %. `w5x` in `/api/status` (frames, batches, ms in SPI, ms delivering to Wi-Fi) and `/api/cpu` show where the time goes - compare two readings taken under load before optimizing anything.
-- The C5 is single-core, so Wi-Fi, the W5500 task and lwIP share one CPU. Don't expect WT32-EMAC numbers without measuring.
-- Power: the NiceMCU module's LDO also feeds the W5500 and resets the board under sustained LAN -> Wi-Fi load (>~12 Mbit/s; heat in the regulator, it lags the SoC temperature). `thermal_tick()` in `bridge.cpp` throttles LAN -> Wi-Fi from the SoC temperature (`cpustat_temp_x10()`, `thr_off`) and to a fixed cap (`e2w_max_mbit`), enforced by a token bucket in `eth_rx_cb()`. Load tests that end in power-on resets are a hardware symptom, not a firmware bug - check `rst`/`rtc` and the crash history before debugging code, and remember that a reset within 30 s of an OTA rolls the image back.
-- The C5's LP core cannot help the data path: it has no access to the Wi-Fi driver or SPI2 and only reaches LP GPIOs IO0–IO6.
+# AGENTS.md — Qvantum QE4 Wi-Fi bridge fork
+
+Instructions for coding agents and reviewers. **This fork's requirements take precedence over inherited upstream documentation, build targets, examples and assumptions.** Read this file and the actual source/configuration before making claims. Do not treat intended functionality as implemented.
+
+## Project scope and hardware
+
+- **Only supported product target: WT32-ETH01, classic ESP32 with LAN8720 Ethernet PHY and 2.4 GHz Wi-Fi, using a 4 MB flash configuration.** The actual flash chip on the purchased board must be checked with `esptool flash-id` before flashing. Do not assume the original author's measured 8 MB chip applies to this board.
+- Do not develop or test unrelated hardware targets, including ESP32-C5/W5500 and 8 MB variants. They are not product requirements. Only inspect legacy code when needed to remove it safely or to assess shared-code regressions.
+- The existing `platformio.ini` still defines an 8 MB WT32 build and a C5/W5500 build. **These are legacy configurations, not evidence that either is a supported target.** Before hardware flashing, implement and validate a 4 MB-compatible partition table, OTA slots, image header, sdkconfig and PlatformIO settings. Do not flash an 8 MB image to a 4 MB chip.
+- Preserve ESP-IDF via PlatformIO (no Arduino) unless a specific change is approved. Keep existing bridge implementation; avoid a wholesale rewrite.
+
+## Purpose and network invariants
+
+The device provides an Ethernet-to-Wi-Fi bridge for a **Qvantum QE4 heat pump**, allowing Home Assistant and Modbus TCP communication over the existing network.
+
+- Preserve the existing transparent, MAC-cloning layer-2 bridge design: the heat pump remains in the existing IPv4 IoT VLAN/subnet and obtains its own address from the existing DHCP server. **No NAT, double NAT, additional routed subnet, WDS requirement or IPv6 dependency.**
+- Keep a **separate, configurable static IPv4 address for the ESP32's own outbound MQTT telemetry** (not a permanent management service). It must not collide with the heat pump address or DHCP allocations. Configure IP, netmask, gateway and DNS in provisioning. Validate uniqueness and routing assumptions; sharing the cloned MAC across two IP addresses requires careful ARP and receive-path handling.
+- Normal operation must expose **no HTTP portal, admin API, OTA endpoint or other listening management service**. Do not accidentally remove the local IPv4 stack needed for outbound MQTT and its replies.
+- MQTT is **outbound telemetry only** for Home Assistant, including useful link status (RSSI, connection state, uptime, reconnects, watchdog/recovery counters). No inbound MQTT commands, control or remote configuration. MQTT outages must not block Ethernet/Wi-Fi forwarding.
+- Preserve bidirectional Modbus TCP, ARP, DHCP, DNS and relevant broadcast traffic for the bridged client. Avoid assumptions that traffic is continuous; an idle heat pump is not a failed bridge.
+
+## Provisioning, security and recovery
+
+- Provide an explicit **non-destructive** provisioning entry mechanism that retains saved settings. Factory reset must be a separate intentional operation. Define the physical trigger, boot behavior, timeout and exit path before implementing.
+- Run setup AP and web administration **only while provisioning**. Do not use a shared/default AP password such as `bridgesetup`; use a unique strong credential or another defensible first-use enrollment method.
+- Provision Wi-Fi settings, static ESP32 IPv4/netmask/gateway/DNS, MQTT broker/port/credentials, and any necessary recovery settings. Validate input and preserve backward compatibility of existing NVS `BridgeConfig` blobs: **append fields, never reorder existing fields** without an explicit migration.
+- Management functions, firmware updates and diagnostics must be provisioning-only. Choose USB flashing and/or provisioning-only OTA deliberately; if OTA is retained, verify the 4 MB dual-slot partition budget and meaningful rollback/confirmation. Never assume the original 8 MB layout fits.
+- Use a **local watchdog**, not gateway ping, DNS, MQTT, internet access or Modbus response as the sole health criterion. Detect genuine link/driver faults, distinguish low traffic, and escalate conservatively (link recovery, Wi-Fi reconnect, reboot). Avoid recovery loops and preserve crash diagnostics where feasible.
+- Avoid unauthenticated configuration writes and unprotected OTA in provisioning. Review secret handling, broker ACLs, optional TLS, flash encryption and secure boot as explicit tradeoffs; do not claim these are enabled without evidence.
+- No hard-coded personal IP addresses, SSIDs, passwords, names, network topology or other private deployment details in committed code or documentation.
+
+## Implementation and code review
+
+- **Scope every review to the supported WT32-ETH01 4 MB target and the QE4 use case.** Ignore inherited C5/W5500 and 8 MB issues unless they directly break shared code or the 4 MB migration.
+- Review the actual diff/PR and surrounding affected code, not unrelated upstream features. Prioritize functional correctness, memory safety, frame/buffer ownership, concurrency, deadlocks, Wi-Fi/ETH callbacks, NVS migration, flash/OTA safety, watchdog loops and security.
+- Explicitly distinguish **existing behavior**, **planned behavior**, **untested assumptions** and **verified on target hardware**. Do not infer completion from this document or from a passing build.
+- Check relevant open PRs (#2–#4) and their base/head branches before recommending changes or merging; do not assume their changes are already in `main`. Avoid duplicating or conflicting with in-flight work.
+- Keep changes minimal and isolated. Use a separate branch and PR; do not merge without review. Do not modify unrelated targets merely to satisfy an all-environments build.
+- Use English for source comments, identifiers, logs, UI and technical documentation. Explain non-obvious functions and ownership/task/IRAM constraints; avoid personal details and historical anecdotes in code comments.
+- Respect hot-path timing and buffer ownership: receive callbacks must release/forward each buffer exactly once. MQTT, scans, provisioning and diagnostics must not block the forwarding path.
+- Treat `sdkconfig.*` as potentially stale generated configuration. Verify effective settings, partition offsets, image headers and flash sizes instead of trusting comments or a successful compile.
+- Build the supported 4 MB configuration once it exists. Hardware validation must cover: cold boot, MAC cloning, DHCP/ARP, bidirectional Modbus TCP, idle client, MQTT broker outage/reconnect, Wi-Fi loss/recovery, provisioning without reset, saved configuration migration, and firmware update/rollback if supported.
+- If hardware is unavailable, report **not hardware-tested**; do not claim production readiness.
+
+## Legacy implementation to change or remove
+
+This is a **migration checklist**, not a list of features to preserve. Verify each item against the current branch and open PRs before changing it. Remove an item from this checklist once the code and configuration are updated and verified. Keep historical explanations in Git history or `docs/content/history.md`, not in this file.
+
+| Existing or inherited behavior | Required disposition |
+| --- | --- |
+| WT32 build assumes 8 MB flash and uses `partitions_8mb_ota.csv` | Replace with a validated 4 MB configuration, including image header and viable OTA/rollback strategy. Confirm the actual chip first. |
+| Additional ESP32-C5/W5500 build target | Remove from the supported build/review workflow; delete target-specific code/config only when safe for the WT32 build. |
+| HTTP management server and API available in normal bridge mode | Disable/remove normal-mode listeners; keep administration and diagnostics in provisioning only. Preserve outbound MQTT connectivity. |
+| Shared/default setup AP password | Replace with secure first-use provisioning credentials/enrollment. |
+| Factory-reset GPIO also used to enter setup | Provide a separate non-destructive provisioning path; retain an intentional factory reset. |
+| Gateway ping used by watchdog | Replace health detection with local link/driver signals, with idle-client protection and staged recovery. |
+| Gateway ping used to identify network profile | Remove or redesign independently of watchdog; verify need for multiple profiles. |
+| IP-camera-centric tuning, multi-site/5 GHz features and obsolete diagnostics | Keep only if justified for the QE4 and supported hardware. Avoid deleting shared behavior without checking dependencies and NVS compatibility. |
+| HTTP OTA endpoint reachable in normal mode | Move to provisioning-only OTA or replace with USB flashing; revalidate 4 MB partition and rollback constraints. |
+
+Do not assume any checklist item is still present after PR #2–#4. Review the actual code and mark it resolved only after evidence. This checklist describes **work to inspect**, not confirmed bugs in every branch.
+
+## Repository navigation and source of truth
+
+- `platformio.ini`, `sdkconfig.defaults`, `sdkconfig.wt32-eth01`, partition CSV files: inspect **actual** build settings; inherited 8 MB/C5 definitions need cleanup as separate implementation work.
+- `src/bridge.cpp`: Ethernet/Wi-Fi forwarding, MAC cloning, network callbacks, watchdog.
+- `src/config.cpp` / `src/config.h`: persisted configuration and NVS compatibility.
+- `src/web.cpp`: existing portal/API; planned restriction to provisioning.
+- `src/telemetry.cpp`: MQTT state and Home Assistant discovery.
+- `src/main.cpp`: startup, provisioning lifecycle, recovery/OTA confirmation.
+- `docs/content/handoff.md`, `docs/content/backlog.md`, `docs/content/history.md`: inherited implementation notes and history; they may describe the original camera/8 MB/C5 setup and **are not current requirements for this fork**. Update handoff/backlog when implementation status changes.
+
+## Unresolved project decisions
+
+1. Confirm actual flash size and establish a safe 4 MB partition/OTA plan.
+2. Choose the non-destructive provisioning entry/exit mechanism and secure AP enrollment.
+3. Choose provisioning-only OTA vs serial-only updates and define rollback behavior.
+4. Verify ARP/frame demultiplexing for ESP32 telemetry IP alongside the cloned heat-pump MAC.
+5. Retain only QE4-relevant roaming, network profiles and tuning; preserve configuration migration where needed.
+6. Define the precise local watchdog signals and recovery thresholds.
+7. Validate practical Wi-Fi coverage with the installed enclosure and any external antenna modification; RF hardware modifications require physical verification.
+8. Power supply for the board is **not yet settled**. Do not assume the QE4 provides a suitable regulated 5 V output; confirm electrical specifications and isolation before connecting it.
+
+**Priority:** a secure, stable, maintainable QE4 bridge on WT32-ETH01/4 MB, not feature parity with upstream.
