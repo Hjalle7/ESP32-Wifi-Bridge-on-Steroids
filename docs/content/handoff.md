@@ -1,5 +1,13 @@
 # Handoff
 
+## Deployment fork planning status
+
+The QE4 deployment design is documented in [implementation-design.md](implementation-design.md). Only WT32-ETH01/4 MB is supported; Olimex, ESP32-C5/W5500 and 8 MB configurations are legacy/out of scope. This is documentation only; the required 4 MB environment is planned in stacked PR #3, with local recovery/MQTT isolation/authentication in #4. Do not flash the existing 8 MB WT32 build. Verify the actual flash ID, power and antenna before installation. Independent DNS, configuration validation, shared-MAC IPv4 acceptance and on-device recovery/update tests remain required. Not hardware-tested.
+
+## Historical upstream snapshot (not deployment instructions)
+
+Everything below describes upstream camera deployments and unsupported hardware. It is not QE4 acceptance evidence or an instruction to build, flash or test those targets.
+
 Technical state for whoever (human or Claude) picks up the next coding session. This file reflects the *current* state only — overwrite it each time; it is not a log (that's `history.md`) and not project-level context (that's `handover.md`).
 
 ## State as of 2026-09-05

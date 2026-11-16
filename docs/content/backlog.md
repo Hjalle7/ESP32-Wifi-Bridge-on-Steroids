@@ -1,5 +1,13 @@
 # Backlog
 
+## Deployment fork plan
+
+See [implementation-design.md](implementation-design.md) and current [AGENTS.md](../../AGENTS.md). Only WT32-ETH01/4 MB is supported. Establish the 4 MB environment/partitions before flashing, then implement provisioning-only management, local recovery and isolated outbound MQTT in stacked PRs #3/#4. Verify flash ID, power and antenna physically. Independent DNS, transactional validation/address-conflict safeguards, setup timeout policy, security tradeoffs and the full QE4 hardware acceptance matrix remain outstanding; planned work is not implemented by this documentation PR.
+
+## Historical upstream backlog (outside QE4 scope)
+
+The items below are retained context, not current product requirements or instructions to build/test C5/W5500 or 8 MB targets.
+
 Open tasks and known issues, current priority first. Mutable — edit freely, remove items once done (the permanent record of *that they were done* belongs in `history.md`).
 
 ## Code review 2026-10-18 (of PR #13, restart tagging) — all fixed in branch `worktree-perf-review-fixes`
