@@ -33,6 +33,7 @@ struct BridgeStats {bool wifi_up,eth_link;};
 static uint32_t clock_ms=0,last_activity=0,learn_at=UINT32_MAX;
 static int portals=0,servers=0,restarts=0,stops=0,erases=0,saves=0;
 static int eth_calls=0,wifi_calls=0,ticks=0,valid_calls=0,rollback_calls=0;
+static int nvs_result=0;static bool config_readable=true;
 static int reset_reason=ESP_RST_SW,ota_state=2;
 static bool pin_low=false,active=false,eth_ok=true,wifi_init_ok=true;
 static bool wifi_up=false,eth_link=true,sniff_ok=true,mac_known=true;
@@ -45,12 +46,12 @@ static int esp_reset_reason(){return reset_reason;}
 static int esp_wifi_stop(){++stops;return 0;}
 static int gpio_config(gpio_config_t*){return 0;}
 static int gpio_get_level(int){return pin_low?0:1;}
-static int nvs_flash_init(){return 0;}
+static int nvs_flash_init(){return nvs_result;}
 static int nvs_flash_erase(){++erases;return 0;}
 static int esp_netif_init(){return 0;}
 static int esp_event_loop_create_default(){return 0;}
 static void conlog_persist_prev(){}
-static void cfg_load(){}
+static bool cfg_load(){return config_readable;}
 static void cfg_save(){++saves;}
 static void crashlog_boot(bool){}
 static bool bridge_consume_planned_restart(){bool r=planned;planned=false;return r;}
@@ -58,6 +59,9 @@ static bool bridge_consume_requested_restart(){bool r=requested;requested=false;
 static void bridge_restart_requested(){requested=true;esp_restart();}
 static bool portal_start_ap(){++portals;return true;}
 static bool web_start(bool provisioning){assert(provisioning);++servers;last_activity=millis();return true;}
+static void web_expire(){}
+static bool web_exit_requested(){return false;}
+static bool web_shutdown_ready(){return true;}
 static uint32_t web_last_activity_ms(){return last_activity;}
 static bool bridge_eth_init(){++eth_calls;return eth_ok;}
 static bool bridge_sniff_client_mac(uint32_t){return sniff_ok;}
@@ -86,6 +90,12 @@ static void simulate_boot(){active=false;s_provisioning=false;s_stable_reported=
 int main(int argc,char **argv){
  assert(argc==2);std::string c=argv[1];
  Config saved=g_cfg;
+ if(c=="nvs-unreadable"||c=="config-unreadable"){
+  if(c=="nvs-unreadable")nvs_result=ESP_ERR_NVS_NO_FREE_PAGES;
+  else config_readable=false;
+  bridge_setup();bridge_loop();assert_closed();assert(!restarts&&!active);
+  return 0;
+ }
  if(c=="no-mac"||c=="no-mac-ota"){
   memset(g_cfg.client_mac,0,6);sniff_ok=false;mac_known=false;
   if(c=="no-mac"){
@@ -202,7 +212,7 @@ with tempfile.TemporaryDirectory() as directory:
         cpp=path/(name+'.cpp');cpp.write_text(unit)
         binary=path/name
         subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-I'+str(ROOT/'src'),str(cpp),'-o',str(binary)],check=True)
-        cases = ('wifi-association','repeated-boots','eth-failure','wifi-init-failure',
+        cases = ('nvs-unreadable','config-unreadable','wifi-association','repeated-boots','eth-failure','wifi-init-failure',
                  'watchdog','stale-physical','ota-failure','ota-eth-failure','gpio-boot','gpio-runtime',
                  'initial','no-mac','no-mac-ota','absolute','held-expiry','inactivity','wrap','empty-ssid') if name=='lifecycle' else ('retry',)
         for case in cases:

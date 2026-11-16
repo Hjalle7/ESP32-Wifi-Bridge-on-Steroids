@@ -20,3 +20,7 @@ bool web_start(bool provisioning);
  * provisioning mode, see config.h: ap_idle_reboot_s. 0 until the first
  * request. */
 uint32_t web_last_activity_ms(void);
+
+void web_expire(void);
+bool web_shutdown_ready(void);
+bool web_exit_requested(void);

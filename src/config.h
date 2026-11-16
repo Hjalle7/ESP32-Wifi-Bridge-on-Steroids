@@ -205,9 +205,9 @@ struct BridgeConfig {
 
 extern BridgeConfig g_cfg;
 
-/* Load the configuration from NVS into g_cfg; falls back to defaults if
- * nothing (valid) is stored. */
-void cfg_load(void);
+/* Return false for unreadable/missing commissioned configuration. Only an
+ * absent namespace without a commissioning marker permits initial setup. */
+bool cfg_load(void);
 /* Write g_cfg to NVS. Returns false if NVS could not be opened or written. */
 bool cfg_save(void);
 /* Fill *c with factory defaults. */

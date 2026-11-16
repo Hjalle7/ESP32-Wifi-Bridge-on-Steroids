@@ -24,6 +24,7 @@ end = telemetry.index('/* Worker-only network operation', start)
 producer = telemetry[start:end]
 common = r'''
 #include <atomic>
+#include <mutex>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -41,6 +42,8 @@ static uint32_t clock_ms=0, s_session_started_at=0, s_last_activity_ms=0;
 static uint32_t millis(){return clock_ms;}
 static char s_http_password[33]="unit-test-secret";
 static char s_http_basic[96]="Basic dW5pdC10ZXN0";
+static std::mutex s_ota_mutex;
+static bool session_closed(){return false;}
 static int calls=0;
 static const char *PAGE="setup page";
 constexpr int HTTPD_RESP_USE_STRLEN=-1;
@@ -95,6 +98,7 @@ int main() {
 '''
 queue_preamble = r'''
 #include <atomic>
+#include <mutex>
 #include <cassert>
 #include <cstdio>
 #include <cstring>

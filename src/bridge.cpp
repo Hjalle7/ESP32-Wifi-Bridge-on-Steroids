@@ -1218,7 +1218,7 @@ static bool        net_in_use(size_t i) { return net_ssid(i)[0] != '\0'; }
  * match, which in a mesh with several nodes under one SSID is a lottery -
  * and the ESP32 does not switch on its own afterwards. ALL_CHANNEL_SCAN
  * costs a few seconds per connect. */
-static void sta_set_net(size_t i) {
+static bool sta_set_net(size_t i) {
   wifi_config_t wc = {};
   strncpy((char *)wc.sta.ssid,     net_ssid(i), sizeof(wc.sta.ssid) - 1);
   strncpy((char *)wc.sta.password, net_pass(i), sizeof(wc.sta.password) - 1);
@@ -1229,6 +1229,7 @@ static void sta_set_net(size_t i) {
   if (e != ESP_OK) printf("[WIFI] set_config('%s'): %s\n", net_ssid(i), esp_err_to_name(e));
   s_cur_net = (uint8_t)i;
   s_ap_locked = false;
+  return e == ESP_OK;
 }
 
 /* --- AP selection by band ------------------------------------------------- */
@@ -1414,6 +1415,25 @@ static bool scan_visible_nets(bool vis[3], wifi_ap_record_t best[3], bool have[3
  * with several attempts. The explicitly selected IP profile is applied
  * before association, avoiding a provisional address on another subnet. */
 bool bridge_wifi_start(void) {
+  bool initialized = false, started = false;
+  auto fail = [&]() {
+    s_active = false;
+    s_wifi_up = false;
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_evt);
+    esp_unregister_shutdown_handler(disc_on_restart);
+    if (started) esp_wifi_stop();
+    if (initialized && esp_wifi_deinit() != ESP_OK) {
+      // Retain the attachment if driver teardown failed; never free an object
+      // the driver may still reference. Recovery is a physical reboot.
+      printf("[WIFI] Teardown incomplete; retaining netif until reboot\n");
+      return false;
+    }
+    if (s_mgmt_netif) {
+      esp_netif_destroy_default_wifi(s_mgmt_netif);
+      s_mgmt_netif = nullptr;
+    }
+    return false;
+  };
 #ifdef BRIDGE_MINIMAL
   /* Measurement variant: NO management netif. Without s_mgmt_netif,
    * is_for_mgmt() returns false immediately and the data path forwards
@@ -1503,9 +1523,11 @@ bool bridge_wifi_start(void) {
            esp_err_to_name(werr));
     wifi_init_config_t fb = WIFI_INIT_CONFIG_DEFAULT();
     fb.rx_ba_win = 6;          /* conservative, fits any buffer count */
-    ESP_ERROR_CHECK(esp_wifi_init(&fb));
+    if (esp_wifi_init(&fb) != ESP_OK) return fail();
     wcfg = fb;
   }
+
+  initialized = true;
 
   /* Remember for display what actually went into the driver - recorded only
    * after the stage that succeeded, so a fallback shows up in the portal as
@@ -1520,9 +1542,9 @@ bool bridge_wifi_start(void) {
   esp_err_t sh = esp_register_shutdown_handler(disc_on_restart);
   if (sh != ESP_OK) printf("[WIFI] shutdown handler: %s\n", esp_err_to_name(sh));
 
-  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));   /* throughput over power */
+  if (esp_wifi_set_storage(WIFI_STORAGE_RAM) != ESP_OK) return fail();
+  if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK) return fail();
+  if (esp_wifi_set_ps(WIFI_PS_NONE) != ESP_OK) return fail();   /* throughput over power */
 
   /* 802.11b can be disabled: the b rates are slow and, as basic rates, waste
    * airtime. Only sensible if no pure 802.11b device is left on the network -
@@ -1575,8 +1597,8 @@ bool bridge_wifi_start(void) {
   }
 
   /* Register after the esp_netif handlers - the order matters. */
-  esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                      &wifi_evt, NULL, NULL);
+  if (esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                      &wifi_evt, NULL, NULL) != ESP_OK) return fail();
 
   /* Portal overrides, 0 = firmware default - same convention as the other
    * tuning values (config.h). Remembered for display, and they also set how
@@ -1590,18 +1612,19 @@ bool bridge_wifi_start(void) {
 
   size_t first = 3;
   for (size_t i = 0; i < 3 && first == 3; i++) if (net_in_use(i)) first = i;
-  if (first == 3) return false;
+  if (first == 3) return fail();
 
   /* The MAC is the same for every network, so the driver is started once:
    * set_config, THEN set_mac, THEN start. Switching networks afterwards only
    * needs a new config (sta_set_net()). */
-  sta_set_net(first);
+  if (!sta_set_net(first)) return fail();
   esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, s_client_mac);
   if (err != ESP_OK) {
     printf("[WIFI] set_mac: %s\n", esp_err_to_name(err));
-    return false;
+    return fail();
   }
-  ESP_ERROR_CHECK(esp_wifi_start());
+  if (esp_wifi_start() != ESP_OK) return fail();
+  started = true;
 
   /* Needs a started driver, like the TX power below. Purely diagnostic, so
    * a failure is only logged. */

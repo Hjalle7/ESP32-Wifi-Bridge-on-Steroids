@@ -46,52 +46,96 @@ void cfg_defaults(BridgeConfig *c) {
  * copied and the rest stays at its default. Without this, every firmware
  * update that adds a field would wipe the configuration and leave the board
  * stuck in the setup AP instead of doing its job. */
-void cfg_load(void) {
+bool cfg_load(void) {
   cfg_defaults(&g_cfg);
+  // Default to closed until absence or a valid blob has been established.
+  g_cfg.configured = true;
+  nvs_handle_t guard;
+  esp_err_t ge = nvs_open("provisioning", NVS_READONLY, &guard);
+  uint8_t commissioned = 0;
+  if (ge == ESP_OK) {
+    ge = nvs_get_u8(guard, "commissioned", &commissioned);
+    nvs_close(guard);
+  }
+  if (ge != ESP_OK && ge != ESP_ERR_NVS_NOT_FOUND) return false;
 
   nvs_handle_t h;
-  if (nvs_open(CFG_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
-    printf("[CFG ] No NVS namespace - using defaults\n");
-    return;
+  esp_err_t opened = nvs_open(CFG_NVS_NS, NVS_READONLY, &h);
+  if (opened != ESP_OK) {
+    if (opened == ESP_ERR_NVS_NOT_FOUND && !commissioned) {
+      g_cfg.configured = false;
+      return true;
+    }
+    return false;
   }
 
   /* Query the stored size first. */
   size_t sz = 0;
   esp_err_t err = nvs_get_blob(h, CFG_NVS_KEY, NULL, &sz);
-  if (err != ESP_OK || sz < sizeof(uint32_t)) {
+  if (err != ESP_OK || sz < offsetof(BridgeConfig, configured) + sizeof(g_cfg.configured)) {
     nvs_close(h);
     printf("[CFG ] No stored configuration - using defaults\n");
-    return;
+    return false;
   }
 
   uint8_t *raw = (uint8_t *)malloc(sz);
-  if (!raw) { nvs_close(h); return; }
+  if (!raw) { nvs_close(h); return false; }
 
   err = nvs_get_blob(h, CFG_NVS_KEY, raw, &sz);
   nvs_close(h);
 
-  if (err != ESP_OK) { free(raw); return; }
+  if (err != ESP_OK) { free(raw); return false; }
 
   uint32_t magic;
   memcpy(&magic, raw, sizeof(magic));
   if (magic != CFG_MAGIC) {
     free(raw);
     printf("[CFG ] Magic mismatch - using defaults\n");
-    return;
+    return false;
   }
 
+  if (raw[offsetof(BridgeConfig, configured)] > 1) { free(raw); return false; }
   BridgeConfig tmp;
   cfg_defaults(&tmp);
   memcpy(&tmp, raw, sz < sizeof(tmp) ? sz : sizeof(tmp));
   free(raw);
 
+  if (!memchr(tmp.name, '\0', sizeof(tmp.name))) return false;
+  if (!memchr(tmp.ssid1, '\0', sizeof(tmp.ssid1))) return false;
+  if (!memchr(tmp.pass1, '\0', sizeof(tmp.pass1))) return false;
+  if (!memchr(tmp.ssid2, '\0', sizeof(tmp.ssid2))) return false;
+  if (!memchr(tmp.pass2, '\0', sizeof(tmp.pass2))) return false;
+  if (!memchr(tmp.mqtt_host, '\0', sizeof(tmp.mqtt_host))) return false;
+  if (!memchr(tmp.mqtt_user, '\0', sizeof(tmp.mqtt_user))) return false;
+  if (!memchr(tmp.mqtt_pass, '\0', sizeof(tmp.mqtt_pass))) return false;
+  if (!memchr(tmp.admin_pass, '\0', sizeof(tmp.admin_pass))) return false;
+  if (!memchr(tmp.ssid3, '\0', sizeof(tmp.ssid3))) return false;
+  if (!memchr(tmp.pass3, '\0', sizeof(tmp.pass3))) return false;
+  if (commissioned && !tmp.configured) return false;
   g_cfg = tmp;
+  // Legacy configured blobs acquire the independent loss-detection marker.
+  if (g_cfg.configured && !commissioned) {
+    if (nvs_open("provisioning", NVS_READWRITE, &guard) != ESP_OK) return false;
+    esp_err_t marked = nvs_set_u8(guard, "commissioned", 1);
+    if (marked == ESP_OK) marked = nvs_commit(guard);
+    nvs_close(guard);
+    if (marked != ESP_OK) return false;
+  }
   printf("[CFG ] Loaded (%u of %u bytes): name='%s' ssid1='%s'\n",
                 (unsigned)sz, (unsigned)sizeof(tmp), g_cfg.name, g_cfg.ssid1);
+  return true;
 }
 
 /* Persist g_cfg to NVS (always the full current struct size). */
 bool cfg_save(void) {
+  // Claim commissioning before storing settings: interrupted saves fail closed.
+  if (!g_cfg.configured) return false;
+  nvs_handle_t guard;
+  if (nvs_open("provisioning", NVS_READWRITE, &guard) != ESP_OK) return false;
+  esp_err_t marked = nvs_set_u8(guard, "commissioned", 1);
+  if (marked == ESP_OK) marked = nvs_commit(guard);
+  nvs_close(guard);
+  if (marked != ESP_OK) return false;
   g_cfg.magic = CFG_MAGIC;
 
   nvs_handle_t h;

@@ -224,9 +224,10 @@ static void bridge_setup(void) {
   printf("\n=== ESP32 Wi-Fi <-> Ethernet Bridge ===\n");
 
   esp_err_t nvs = nvs_flash_init();
-  if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ESP_ERROR_CHECK(nvs_flash_erase());
-    ESP_ERROR_CHECK(nvs_flash_init());
+  if (nvs != ESP_OK) {
+    printf("[BOOT] NVS unavailable; serial recovery required, no erase or portal\n");
+    provisioning_requested_at_boot(); // Configure GPIO even in the inactive state.
+    return;
   }
   /* Store the end of the previous boot's log (taken from RAM by
    * conlog_init()) now that NVS is available - see /api/log?prev=1. */
@@ -236,7 +237,14 @@ static void bridge_setup(void) {
   esp_err_t e = esp_event_loop_create_default();
   if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) ESP_ERROR_CHECK(e);
 
-  cfg_load();
+  if (!cfg_load()) {
+    printf("[BOOT] Configuration unreadable; physical recovery required\n");
+    const bool physical = s_portal_request == PORTAL_MAGIC &&
+        bridge_consume_requested_restart() && esp_reset_reason() == ESP_RST_SW;
+    s_portal_request = 0;
+    if (provisioning_requested_at_boot() || physical) enter_provisioning("physical storage recovery");
+    return;
+  }
 
   /* Physical authorization is one-shot, including across faults. */
   const bool portal_forced = (s_portal_request == PORTAL_MAGIC);
@@ -398,7 +406,7 @@ static void bridge_loop(void) {
 #ifndef BRIDGE_MINIMAL
     telemetry_tick();
 #endif
-  } else if (s_provisioning_configured) {
+  } else if (s_provisioning_configured || web_exit_requested()) {
     /* Portal mode: after a while without active portal use, try an ordinary
      * reboot on our own - see config.h: ap_idle_reboot_s. Only with stored
      * credentials (g_cfg.configured), otherwise a fresh or factory-reset
@@ -408,12 +416,14 @@ static void bridge_loop(void) {
      * would prevent the reboot forever. */
     const uint32_t threshold_ms =
         (g_cfg.ap_idle_reboot_s ? g_cfg.ap_idle_reboot_s : AP_IDLE_REBOOT_S_DEF) * 1000UL;
-    if (provisioning_session_expired(s_provisioning_configured, s_provisioning_started_at, millis()) ||
+    if (web_exit_requested() || provisioning_session_expired(s_provisioning_configured, s_provisioning_started_at, millis()) ||
         millis() - web_last_activity_ms() >= threshold_ms) {
       printf("[BOOT] Provisioning session expired (idle or absolute deadline)\n");
-      /* Stop the radio first: HTTP/OTA connections cannot prolong shutdown.
-       * Reboot rebuilds the bridge stack without AP/STA netif reuse hazards. */
+      /* Revoke authorization and wake the upload receiver, then await cleanup.
+       * Reboot rebuilds all remaining HTTP/netif resources after acknowledgement. */
       s_portal_request = 0;
+      web_expire();
+      if (!web_shutdown_ready()) { delay(50); return; }
       esp_wifi_stop();
       bridge_restart_requested();
     }

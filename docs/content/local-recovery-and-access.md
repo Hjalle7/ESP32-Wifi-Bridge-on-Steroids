@@ -34,7 +34,7 @@ Configured devices enter setup only through a deliberate IO14 hold of at least t
 
 After the bounded initial Wi-Fi association attempts, the initialized station stays in normal mode. Normal-mode ticks request reconnects at most once per five seconds independently of the optional watchdog. Disconnect callbacks do not immediately reconnect. Existing bounded watchdog/failover recovery remains available. Initialization failures leave the device inactive with management disabled, without reboot cycling; the setup GPIO remains available. A missing, never-learned client MAC leaves the sniff callback running with 50 ms sleeps, GPIO polling and OTA validation until a client appears. Driver initialization failures require physical setup or a deliberate restart after repair.
 
-Configured setup retains the existing inactivity timeout and adds a fixed 30-minute deadline from entry. Authenticated page/configuration/scan activity can reset inactivity, but cannot reset the absolute deadline; status polling still does not reset inactivity. HTTP dispatch rejects new requests at the absolute deadline. On either timeout the main task stops the Wi-Fi radio (disconnecting in-flight HTTP/OTA), clears any setup request and performs a planned reboot into normal operation. No saved configuration is erased. A continuously held boot setup pin cannot authorize another session across that reboot: it must be released and deliberately held again. First-time setup has no idle or absolute deadline. Pending OTA validation still requires local readiness and rolls back on its existing deadline without requiring provisioning.
+Configured setup retains the existing inactivity timeout and adds a fixed 30-minute deadline from entry. Authenticated page/configuration/scan activity can reset inactivity, but cannot reset the absolute deadline; status polling still does not reset inactivity. HTTP dispatch rejects new requests at the absolute deadline. On either timeout the main task revokes admission, cancels any active OTA upload and waits for cleanup acknowledgement before stopping Wi-Fi and rebooting. No saved configuration is erased. A continuously held boot setup pin cannot authorize another session across that reboot: it must be released and deliberately held again. First-time setup has no idle or absolute deadline. Pending OTA validation still requires local readiness and rolls back on its existing deadline without requiring provisioning.
 
 ## Setup authentication
 
@@ -67,3 +67,49 @@ Correction validation: firmware commit `82cd587` built successfully for `wt32-et
 Provisioning regression tests execute the actual startup, GPIO, main loop, OTA validation and paced retry helper with simulated drivers and time. They cover startup association exhaustion, repeated failed boots, Ethernet/Wi-Fi initialization failure, watchdog recovery, stale RTC requests after a watchdog reset, OTA rollback, boot/runtime physical entry, one-shot authorization, held-pin expiry, inactivity extension, the absolute boundary and timer wrap. HTTP boundary tests execute the actual authenticated page handler: activity updates inactivity while the absolute deadline still denies requests. Unconfigured setup remains available past 30 minutes. These host checks do not replace device tests of radio shutdown during active HTTP/OTA, physical GPIO, brownout/watchdog resets or bootloader rollback.
 
 Provisioning correction validation: all seven host suites passed (runtime policies, HTTP/MQTT boundaries, watchdog, NVS layout, OTA, scan and provisioning lifecycle). Negative controls restoring automatic setup after repeated failures and removing the absolute deadline were rejected. The supported `wt32-eth01-4mb` build passed with PlatformIO Core 6.1.18, pinned platform 55.3.34 and ESP-IDF 5.5.1. The artifact checker verified 4 MB bootloader/app headers, effective flash settings, partition bounds and 970480 / 1966080 bytes per OTA slot (49.4%). No unsupported target was built. The existing IRAM declaration warning remains. Not hardware-tested.
+
+
+## Security recovery correction after 8c8c812
+
+Recoverable Wi-Fi initialization/start errors now return to the inactive main loop.
+Partial startup removes handlers, stops/deinitializes the initialized driver and
+releases the default STA netif. Physical GPIO polling remains available; ordinary
+association exhaustion retains paced normal-mode retries and never opens setup.
+
+NVS initialization errors never erase flash. They leave management disabled;
+unreadable NVS requires deliberate local serial repair/erase. Readable but invalid
+configuration requires GPIO authorization for setup. A separate `provisioning`
+namespace commissioning marker is committed before saving configured settings and
+is added when loading legacy configured blobs. Missing configuration with that
+marker fails closed; missing blobs in an existing config namespace also fail closed.
+Saving an empty primary SSID cannot clear the commissioning claim. Destructive
+reset remains a local serial operation, never an HTTP or automatic recovery action.
+
+Limitation: total NVS erasure/loss (or loss of both the namespace and marker) is
+indistinguishable from a new board. Automatic setup for new boards necessarily
+also covers that state. No guarantee of historical configuration survives complete
+NVS loss; stronger discrimination requires an independently provisioned persistent
+anchor (for example manufacturing enrollment/eFuse), not another NVS key. Such an
+irreversible enrollment scheme is not implemented. Legacy devices cannot acquire
+historical evidence if configuration was already lost before this firmware ran.
+
+Expiry now revokes HTTP/OTA admission, shuts down the active upload socket to wake
+its receiver, and waits for the handler to abort/end OTA and release its buffer
+before stopping Wi-Fi and rebooting. Boot selection is serialized with expiry and
+checks the absolute deadline. Authorization ends at 30 minutes even while cleanup
+is pending; cleanup does not grant more requests or renew the session. OTA success
+uses the same acknowledged main-task shutdown, including first-time setup.
+
+Host tests include storage/read/marker faults, lost blobs, legacy migration,
+Wi-Fi fallback and partial-start cleanup, and OTA admission/cancellation acknowledgement.
+Negative controls restore fatal init, missing-marker bypass and expired admission.
+Target acceptance still requires actual socket wakeup, flash cancellation/commit,
+GPIO, Wi-Fi driver cleanup, bootloader rollback, heap/stack and QE4 traffic testing.
+
+Validation of this correction: all seven existing host suites plus the new recovery
+fault suite passed. Five negative controls (fatal Wi-Fi init, missing-config bypass,
+expired OTA admission, repeated-failure provisioning, and removed absolute deadline)
+were rejected. The WT32-ETH01 4 MB build and flash-layout checker passed with
+PlatformIO 6.1.18 / pinned platform 55.3.34 / ESP-IDF 5.5.1: 977312 bytes of
+1966080 per OTA slot (49.7%), matching 4 MB headers/Kconfig and valid partition
+bounds. The pre-existing IRAM attribute warning remains. Not hardware-tested.

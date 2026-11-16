@@ -19,6 +19,8 @@
  */
 
 #include "web.h"
+#include <mutex>
+#include <sys/socket.h>
 #include "provisioning_session.h"
 #include "config.h"
 #include "bridge.h"
@@ -57,6 +59,48 @@ static bool           s_provisioning = false;
 static uint32_t       s_last_activity_ms = 0;
 static uint32_t       s_session_started_at = 0;
 static bool           s_session_configured = false;
+
+// Serialize admission, cancellation and boot-selection commits. Never hold
+// this mutex across socket reads or OTA erase/write operations.
+static std::mutex s_ota_mutex;
+static bool s_expired = false, s_ota_active = false;
+static int s_ota_socket = -1;
+void web_expire(void) {
+  std::lock_guard<std::mutex> lock(s_ota_mutex);
+  s_expired = true;
+  if (s_ota_socket >= 0) shutdown(s_ota_socket, SHUT_RDWR);
+}
+bool web_exit_requested(void) {
+  std::lock_guard<std::mutex> lock(s_ota_mutex);
+  return s_expired;
+}
+bool web_shutdown_ready(void) {
+  std::lock_guard<std::mutex> lock(s_ota_mutex);
+  return !s_ota_active;
+}
+static bool session_closed(void) {
+  return s_expired || provisioning_session_expired(s_session_configured, s_session_started_at, millis());
+}
+struct OtaSession {
+  bool admitted = false;
+  explicit OtaSession(httpd_req_t *r) {
+    std::lock_guard<std::mutex> lock(s_ota_mutex);
+    if (!session_closed() && !s_ota_active) {
+      s_ota_active = admitted = true;
+      s_ota_socket = httpd_req_to_sockfd(r);
+    }
+  }
+  bool cancelled() {
+    std::lock_guard<std::mutex> lock(s_ota_mutex);
+    return session_closed();
+  }
+  ~OtaSession() {
+    if (!admitted) return;
+    std::lock_guard<std::mutex> lock(s_ota_mutex);
+    s_ota_socket = -1;
+    s_ota_active = false; // acknowledgement after the handler releases OTA resources
+  }
+};
 
 uint32_t web_last_activity_ms(void) { return s_last_activity_ms; }
 
@@ -2071,7 +2115,9 @@ static bool same_origin_request(httpd_req_t *r) {
  * authentication and origin checks; failed attempts never extend AP uptime. */
 static esp_err_t provisioning_dispatch(httpd_req_t *r) {
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
-  if (!s_provisioning ||
+  bool expired;
+  { std::lock_guard<std::mutex> lock(s_ota_mutex); expired = session_closed(); }
+  if (expired || !s_provisioning ||
       provisioning_session_expired(s_session_configured, s_session_started_at, millis()) ||
       !admin_key_ok(r)) {
     httpd_resp_set_hdr(r, "WWW-Authenticate", "Basic realm=\"Bridge setup\"");
@@ -2093,6 +2139,8 @@ static esp_err_t provisioning_dispatch(httpd_req_t *r) {
  * image boots as PENDING_VERIFY and is rolled back unless it confirms itself
  * (see main.cpp: ota_confirm_if_pending()). */
 static esp_err_t h_update(httpd_req_t *r) {
+  OtaSession session(r);
+  if (!session.admitted) return ESP_FAIL;
   if (!admin_key_ok(r)) {
     httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
     return ESP_FAIL;
@@ -2122,6 +2170,7 @@ static esp_err_t h_update(httpd_req_t *r) {
   esp_ota_handle_t ota = 0;
   esp_err_t err = esp_ota_begin(target, OTA_SIZE_UNKNOWN, &ota);
   if (err != ESP_OK) {
+    if (ota) esp_ota_abort(ota);
     bridge_set_paused(false);
     httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
     return ESP_FAIL;
@@ -2139,7 +2188,14 @@ static esp_err_t h_update(httpd_req_t *r) {
   bool header_checked = false;
 
   while (remaining > 0) {
+    if (session.cancelled()) {
+      free(buf); esp_ota_abort(ota); bridge_set_paused(false);
+      return ESP_FAIL;
+    }
     int n = httpd_req_recv(r, buf, remaining < 4096 ? remaining : 4096);
+    if (session.cancelled()) {
+      free(buf); esp_ota_abort(ota); bridge_set_paused(false); return ESP_FAIL;
+    }
     if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
     if (n <= 0) {
       free(buf); esp_ota_abort(ota); bridge_set_paused(false);
@@ -2169,6 +2225,9 @@ static esp_err_t h_update(httpd_req_t *r) {
   }
   free(buf);
 
+  if (session.cancelled()) {
+    esp_ota_abort(ota); bridge_set_paused(false); return ESP_FAIL;
+  }
   err = esp_ota_end(ota);
   if (err != ESP_OK) {
     bridge_set_paused(false);
@@ -2178,7 +2237,12 @@ static esp_err_t h_update(httpd_req_t *r) {
     return ESP_FAIL;
   }
 
-  err = esp_ota_set_boot_partition(target);
+  // Expiry cannot race boot metadata updates; reject a commit after deadline.
+  {
+    std::lock_guard<std::mutex> lock(s_ota_mutex);
+    if (session_closed()) { bridge_set_paused(false); return ESP_FAIL; }
+    err = esp_ota_set_boot_partition(target);
+  }
   if (err != ESP_OK) {
     bridge_set_paused(false);
     httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
@@ -2189,7 +2253,8 @@ static esp_err_t h_update(httpd_req_t *r) {
   httpd_resp_set_type(r, "application/json");
   httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
   delay(600);
-  bridge_restart_requested();
+  // Main owns shutdown after the RAII acknowledgement, including success.
+  web_expire();
   return ESP_OK;
 }
 
