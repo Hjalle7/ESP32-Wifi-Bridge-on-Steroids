@@ -197,16 +197,30 @@ static bool form_get(const char *body, const char *key, char *out, size_t out_le
   return false;
 }
 
-/* Escape a string for use inside a JSON string literal (" and \ only).
- * Passwords are never output, but SSIDs and names are. The output can be up
- * to twice as long as the input. */
-static void json_escape(const char *in, char *out, size_t out_len) {
+/* JSON control bytes need up to six bytes (\u00XX), plus the final NUL.
+ * Bounded callers retain a valid escaped prefix: never split an escape.
+ * An explicit input length also supports embedded NUL bytes. */
+static bool json_escape(const char *in, char *out, size_t out_len,
+                        size_t in_len = SIZE_MAX) {
+  if (!out_len) return false;
+  if (in_len == SIZE_MAX) in_len = strlen(in);
+  static const char hex[] = "0123456789abcdef";
   size_t o = 0;
-  for (size_t i = 0; in[i] && o + 2 < out_len; i++) {
-    if (in[i] == '"' || in[i] == '\\') out[o++] = '\\';
-    out[o++] = in[i];
+  out[0] = '\0';
+  for (size_t i = 0; i < in_len; i++) {
+    const unsigned char c = (unsigned char)in[i];
+    const size_t need = c < 0x20 ? 6 : (c == '"' || c == '\\' ? 2 : 1);
+    if (need >= out_len - o) return false;
+    if (c < 0x20) {
+      out[o++] = '\\'; out[o++] = 'u'; out[o++] = '0'; out[o++] = '0';
+      out[o++] = hex[c >> 4]; out[o++] = hex[c & 15];
+    } else {
+      if (c == '"' || c == '\\') out[o++] = '\\';
+      out[o++] = (char)c;
+    }
+    out[o] = '\0';
   }
-  out[o] = '\0';
+  return true;
 }
 
 /* ===========================================================================
@@ -975,13 +989,20 @@ async function load(){
 }
 async function scan(){
   $('msg').textContent='Scanning...';
-  const r=await(await fetch('/api/scan')).json();
-  /* Via DOM instead of innerHTML: SSIDs are untrusted data, a neighbor AP
-     named "<img src=x onerror=...>" would otherwise run script in the portal. */
-  const d=$('nets');d.textContent='';
-  r.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;
-    o.textContent=n.ssid+' ('+n.rssi+' dBm)';d.appendChild(o)});
-  $('msg').textContent=r.length+' networks found';
+  try{
+    const response=await fetch('/api/scan');
+    if(!response.ok)throw new Error('Scan request failed');
+    const r=await response.json();
+    if(!Array.isArray(r)||!r.every(n=>n&&typeof n.ssid==='string'&&Number.isFinite(n.rssi)))
+      throw new Error('Invalid scan response');
+    /* SSIDs are untrusted; create DOM nodes rather than interpreting HTML. */
+    const d=$('nets');d.textContent='';
+    r.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;
+      o.textContent=n.ssid+' ('+n.rssi+' dBm)';d.appendChild(o)});
+    $('msg').textContent=r.length+' networks found';
+  }catch(e){
+    $('msg').textContent='Scan failed. Try again or enter the SSID manually.';
+  }
 }
 /* rb=true -> save and reboot (Wi-Fi credentials, IP, buffers...).
    rb=false -> save only; TX power and retries take effect immediately, the
@@ -1509,12 +1530,10 @@ static esp_err_t h_config_get(httpd_req_t *r) {
   if (g_cfg.mgmt_gw3[0] || g_cfg.mgmt_gw3[1] || g_cfg.mgmt_gw3[2] || g_cfg.mgmt_gw3[3])
     format_ipv4(g_cfg.mgmt_gw3, gw3, sizeof(gw3));
 
-  /* mu must hold the ESCAPED user name: json_escape() prefixes every " and \
-   * with a backslash, so in the worst case the length doubles. With 64
-   * usable characters that is 128 plus the NUL byte - a smaller buffer would
-   * silently truncate the name, and only for long values, i.e. exactly when
-   * nobody tests it. */
-  char n[64], s1[80], s2[80], s3[80], mh[128], mu[136];
+  /* All user strings can expand to six bytes per input byte. */
+  char n[6 * sizeof(g_cfg.name) + 1];
+  char s1[6 * sizeof(g_cfg.ssid1) + 1], s2[sizeof(s1)], s3[sizeof(s1)];
+  char mh[6 * sizeof(g_cfg.mqtt_host) + 1], mu[6 * sizeof(g_cfg.mqtt_user) + 1];
   json_escape(g_cfg.name,      n,  sizeof(n));
   json_escape(g_cfg.ssid1,     s1, sizeof(s1));
   json_escape(g_cfg.ssid2,     s2, sizeof(s2));
@@ -1526,14 +1545,16 @@ static esp_err_t h_config_get(httpd_req_t *r) {
   bridge_get_effective(&eff);
   bridge_get_defaults(&def);
 
-  /* Passwords are deliberately never returned.
-   * Buffer size: name, three SSIDs, nine IP addresses from three profiles,
-   * host, escaped user name and the tuning numbers add up to roughly
-   * 1750 bytes in the worst case. snprintf truncates cleanly, but a truncated
-   * JSON is unparsable - the form would simply stay empty. Grow this buffer
-   * when adding fields. */
-  char buf[2048];
-  snprintf(buf, sizeof(buf),
+  /* Passwords are deliberately never returned. Keep the expanded response
+   * off the HTTP task stack; reserve 2048 bytes for keys, IPs and numbers. */
+  const size_t cap = sizeof(n) + sizeof(s1) + sizeof(s2) + sizeof(s3)
+                   + sizeof(mh) + sizeof(mu) + 2048;
+  char *buf = (char *)malloc(cap);
+  if (!buf) {
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    return ESP_FAIL;
+  }
+  const int written = snprintf(buf, cap,
     "{\"ip_profile\":%u,\"name\":\"%s\",\"ssid1\":\"%s\",\"ssid2\":\"%s\",\"ssid3\":\"%s\","
     "\"ip\":\"%s\",\"mask\":\"%s\",\"gw\":\"%s\","
     "\"ip2\":\"%s\",\"mask2\":\"%s\",\"gw2\":\"%s\","
@@ -1590,9 +1611,16 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     def.wd_actions, def.wd_bad_windows,
     eff.static_rx, eff.dyn_rx, eff.dyn_tx, eff.ba_win);
 
+  if (written < 0 || (size_t)written >= cap) {
+    free(buf);
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON response too large");
+    return ESP_FAIL;
+  }
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
-  return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+  const esp_err_t err = httpd_resp_send(r, buf, written);
+  free(buf);
+  return err;
 }
 
 /* POST /api/config - parse the form-urlencoded body, validate and clamp
@@ -1939,45 +1967,62 @@ static esp_err_t h_eth_reset(httpd_req_t *r) {
  * activity. */
 static esp_err_t h_scan(httpd_req_t *r) {
   s_last_activity_ms = millis();
+  httpd_resp_set_type(r, "application/json");
+  auto scan_error = [r]() {
+    httpd_resp_set_status(r, "500 Internal Server Error");
+    return httpd_resp_send(r, "{\"error\":\"Wi-Fi scan failed\"}", HTTPD_RESP_USE_STRLEN);
+  };
   wifi_scan_config_t sc = {};
   sc.show_hidden = false;
-
-  if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
-    httpd_resp_set_type(r, "application/json");
-    return httpd_resp_send(r, "[]", HTTPD_RESP_USE_STRLEN);
-  }
+  if (esp_wifi_scan_start(&sc, true) != ESP_OK) return scan_error();
 
   uint16_t n = 0;
-  esp_wifi_scan_get_ap_num(&n);
-  if (n > 20) n = 20;
-
-  wifi_ap_record_t *recs = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * n);
-  if (!recs) {
-    httpd_resp_set_type(r, "application/json");
+  if (esp_wifi_scan_get_ap_num(&n) != ESP_OK) {
+    esp_wifi_clear_ap_list();
+    return scan_error();
+  }
+  if (!n) {
+    esp_wifi_clear_ap_list();
     return httpd_resp_send(r, "[]", HTTPD_RESP_USE_STRLEN);
   }
-  esp_wifi_scan_get_ap_records(&n, recs);
-
-  httpd_resp_set_type(r, "application/json");
-  httpd_resp_sendstr_chunk(r, "[");
-  bool first = true;
-  for (uint16_t i = 0; i < n; i++) {
-    char esc[80], item[128];
-    json_escape((const char *)recs[i].ssid, esc, sizeof(esc));
-    if (!esc[0]) continue;
-    /* Tie the comma to the entry actually emitted, not to i - otherwise
-     * "[,{...}]" results as soon as the first hit is skipped, and the portal
-     * can no longer parse the list. */
-    snprintf(item, sizeof(item), "%s{\"ssid\":\"%s\",\"rssi\":%d}",
-             first ? "" : ",", esc, (int)recs[i].rssi);
-    first = false;
-    httpd_resp_sendstr_chunk(r, item);
+  if (n > 20) n = 20;
+  wifi_ap_record_t *recs = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * n);
+  if (!recs) {
+    esp_wifi_clear_ap_list();
+    return scan_error();
   }
-  httpd_resp_sendstr_chunk(r, "]");
-  httpd_resp_sendstr_chunk(r, NULL);
+  if (esp_wifi_scan_get_ap_records(&n, recs) != ESP_OK) {
+    free(recs);
+    esp_wifi_clear_ap_list();
+    return scan_error();
+  }
 
+  esp_err_t err = httpd_resp_sendstr_chunk(r, "[");
+  bool first = true;
+  for (uint16_t i = 0; i < n && err == ESP_OK; i++) {
+    /* SSIDs contain at most 32 bytes; do not depend on driver termination.
+     * Reserve six bytes per input byte, NUL, and room for JSON/RSSI. */
+    char esc[32 * 6 + 1], item[sizeof(esc) + 32];
+    const size_t len = strnlen((const char *)recs[i].ssid, 32);
+    if (!len) continue;
+    if (!json_escape((const char *)recs[i].ssid, esc, sizeof(esc), len)) {
+      err = ESP_FAIL;
+      break;
+    }
+    const int written = snprintf(item, sizeof(item), "%s{\"ssid\":\"%s\",\"rssi\":%d}",
+                                 first ? "" : ",", esc, (int)recs[i].rssi);
+    if (written < 0 || (size_t)written >= sizeof(item)) {
+      err = ESP_FAIL;
+      break;
+    }
+    err = httpd_resp_sendstr_chunk(r, item);
+    first = false;
+  }
   free(recs);
-  return ESP_OK;
+  if (err != ESP_OK) return err;
+  err = httpd_resp_sendstr_chunk(r, "]");
+  if (err != ESP_OK) return err;
+  return httpd_resp_sendstr_chunk(r, NULL);
 }
 
 
@@ -2193,10 +2238,10 @@ static esp_err_t h_coredump_get(httpd_req_t *r) {
 
   char reason[200] = "";
   esp_core_dump_get_panic_reason(reason, sizeof(reason));
-  char reason_esc[410];
+  char reason_esc[6 * sizeof(reason) + 1];
   json_escape(reason, reason_esc, sizeof(reason_esc));
 
-  char task_esc[40];
+  char task_esc[6 * sizeof(sum.exc_task) + 1];
   json_escape(sum.exc_task, task_esc, sizeof(task_esc));
 
   char bt[400] = "";
@@ -2222,14 +2267,25 @@ static esp_err_t h_coredump_get(httpd_req_t *r) {
   const bool corrupted = false;
 #endif
 
-  char buf[1280];
-  snprintf(buf, sizeof(buf),
+  const size_t cap = sizeof(reason_esc) + sizeof(task_esc) + sizeof(bt) + sizeof(extra) + 256;
+  char *buf = (char *)malloc(cap);
+  if (!buf) {
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    return ESP_FAIL;
+  }
+  const int written = snprintf(buf, cap,
     "{\"present\":true,\"readable\":true,\"corrupted\":%s,"
     "\"task\":\"%s\",\"pc\":\"0x%08lx\",\"reason\":\"%s\",\"bt\":[%s]%s}",
     corrupted ? "true" : "false",
     task_esc, (unsigned long)sum.exc_pc, reason_esc, bt, extra);
-
-  return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+  if (written < 0 || (size_t)written >= cap) {
+    free(buf);
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON response too large");
+    return ESP_FAIL;
+  }
+  const esp_err_t err = httpd_resp_send(r, buf, written);
+  free(buf);
+  return err;
 }
 
 /* DELETE /api/coredump - erase the stored coredump. */
@@ -2264,7 +2320,8 @@ static esp_err_t h_crashes_get(httpd_req_t *r) {
     return ESP_FAIL;
   }
   crash_rec_t *recs = (crash_rec_t *)malloc(sizeof(crash_rec_t) * CRASHLOG_N);
-  const size_t cap = 4608;
+  const size_t cap = CRASHLOG_N * (6 * (sizeof(recs[0].task)
+                   + sizeof(recs[0].reason) + sizeof(recs[0].build)) + 512) + 64;
   char *buf = (char *)malloc(cap);
   if (!recs || !buf) {
     free(recs); free(buf);
@@ -2276,7 +2333,8 @@ static esp_err_t h_crashes_get(httpd_req_t *r) {
   size_t o = snprintf(buf, cap, "{\"now\":%lu,\"recs\":[", (unsigned long)crashlog_now());
   for (size_t i = 0; i < n && o < cap; i++) {
     const crash_rec_t *c = &recs[i];
-    char task[40], reason[200], build[28];
+    char task[6 * sizeof(c->task) + 1], reason[6 * sizeof(c->reason) + 1];
+    char build[6 * sizeof(c->build) + 1];
     json_escape(c->task, task, sizeof(task));
     json_escape(c->reason, reason, sizeof(reason));
     json_escape(c->build, build, sizeof(build));
@@ -2293,7 +2351,11 @@ static esp_err_t h_crashes_get(httpd_req_t *r) {
       (unsigned long)c->pc, reason, bt);
   }
   if (o < cap) o += snprintf(buf + o, cap - o, "]}");
-  if (o >= cap) o = cap - 1;
+  if (o >= cap) {
+    free(recs); free(buf);
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON response too large");
+    return ESP_FAIL;
+  }
   free(recs);
 
   httpd_resp_set_type(r, "application/json");
