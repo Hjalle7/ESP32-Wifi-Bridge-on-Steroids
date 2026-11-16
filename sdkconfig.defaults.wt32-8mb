@@ -1,0 +1,3 @@
+# Retain the upstream reference-board 8 MB target independently.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"

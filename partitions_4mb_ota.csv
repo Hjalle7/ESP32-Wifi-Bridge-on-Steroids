@@ -1,8 +1,9 @@
 # ============================================================================
-#  Partition table for the NiceMCU ESP32-C5 Mini (ESP32-C5HF4, 4 MB flash)
+#  Partition table for WT32-ETH01 and ESP32-C5 targets with 4 MB flash
 # ============================================================================
 #  Same layout as partitions_8mb_ota.csv with smaller app slots. The C5HF4's
-#  flash is inside the chip package, so 4 MB is fixed.
+#  flash is inside the chip package, so 4 MB is fixed. WT32 capacity must
+#  be verified on the actual unit before flashing.
 #
 #    nvs        24 KB  - configuration (BridgeConfig) + Wi-Fi calibration
 #    otadata     8 KB  - remembers which app slot is active

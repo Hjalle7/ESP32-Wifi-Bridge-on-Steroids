@@ -2,7 +2,7 @@
 
 ## Deployment fork planning status
 
-The QE4 deployment design is documented in [implementation-design.md](implementation-design.md). Only WT32-ETH01/4 MB is supported; Olimex, ESP32-C5/W5500 and 8 MB configurations are legacy/out of scope. This is documentation only; the required 4 MB environment is planned in stacked PR #3, with local recovery/MQTT isolation/authentication in #4. Do not flash the existing 8 MB WT32 build. Verify the actual flash ID, power and antenna before installation. Independent DNS, configuration validation, shared-MAC IPv4 acceptance and on-device recovery/update tests remain required. Not hardware-tested.
+Only WT32-ETH01/4 MB is supported. Use `pio run -e wt32-eth01-4mb` and `python scripts/check_flash_layout.py wt32-eth01-4mb 4`; never use the retained legacy 8 MB/C5 builds for deployment. [wt32-deployment.md](wt32-deployment.md) records the initial implementation: 4 MB dual-slot layout, IO14 non-destructive provisioning, unique AP secret and no normal-mode HTTP/OTA/NetBIOS/SNTP; outbound IPv4/MQTT remains. Gateway-dependent watchdog/profile selection, synchronous MQTT and incomplete route authentication remain at this head; stacked PR #4 addresses them. Independent DNS, transactional validation, address-conflict safeguards, security decisions and hardware acceptance remain outstanding. Confirm flash ID, power and antenna physically. Not hardware-tested.
 
 ## Historical upstream snapshot (not deployment instructions)
 

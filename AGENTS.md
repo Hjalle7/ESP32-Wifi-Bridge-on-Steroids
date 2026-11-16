@@ -6,7 +6,7 @@ Instructions for coding agents and reviewers. **This fork's requirements take pr
 
 - **Only supported product target: WT32-ETH01, classic ESP32 with LAN8720 Ethernet PHY and 2.4 GHz Wi-Fi, using a 4 MB flash configuration.** The actual flash chip on the purchased board must be checked with `esptool flash-id` before flashing. Do not assume the original author's measured 8 MB chip applies to this board.
 - Do not develop or test unrelated hardware targets, including ESP32-C5/W5500 and 8 MB variants. They are not product requirements. Only inspect legacy code when needed to remove it safely or to assess shared-code regressions.
-- The existing `platformio.ini` still defines an 8 MB WT32 build and a C5/W5500 build. **These are legacy configurations, not evidence that either is a supported target.** Before hardware flashing, implement and validate a 4 MB-compatible partition table, OTA slots, image header, sdkconfig and PlatformIO settings. Do not flash an 8 MB image to a 4 MB chip.
+- The existing `platformio.ini` still defines an 8 MB WT32 build and a C5/W5500 build. **These are legacy configurations, not evidence that either is a supported target.** This branch adds `wt32-eth01-4mb`; build only that environment and run `python scripts/check_flash_layout.py wt32-eth01-4mb 4`. Before hardware flashing, validate its partition table, OTA slots, image header, sdkconfig and PlatformIO settings. Do not flash an 8 MB image to a 4 MB chip.
 - Preserve ESP-IDF via PlatformIO (no Arduino) unless a specific change is approved. Keep existing bridge implementation; avoid a wholesale rewrite.
 
 ## Purpose and network invariants
@@ -65,7 +65,7 @@ Do not assume any checklist item is still present after PR #2–#4. Review the a
 - `platformio.ini`, `sdkconfig.defaults`, `sdkconfig.wt32-eth01`, partition CSV files: inspect **actual** build settings; inherited 8 MB/C5 definitions need cleanup as separate implementation work.
 - `src/bridge.cpp`: Ethernet/Wi-Fi forwarding, MAC cloning, network callbacks, watchdog.
 - `src/config.cpp` / `src/config.h`: persisted configuration and NVS compatibility.
-- `src/web.cpp`: existing portal/API; planned restriction to provisioning.
+- `src/web.cpp`: provisioning-only portal/API; full route authentication is still required in stacked PR #4.
 - `src/telemetry.cpp`: MQTT state and Home Assistant discovery.
 - `src/main.cpp`: startup, provisioning lifecycle, recovery/OTA confirmation.
 - `docs/content/handoff.md`, `docs/content/backlog.md`, `docs/content/history.md`: inherited implementation notes and history; they may describe the original camera/8 MB/C5 setup and **are not current requirements for this fork**. Update handoff/backlog when implementation status changes.
@@ -82,3 +82,9 @@ Do not assume any checklist item is still present after PR #2–#4. Review the a
 8. Power supply for the board is **not yet settled**. Do not assume the QE4 provides a suitable regulated 5 V output; confirm electrical specifications and isolation before connecting it.
 
 **Priority:** a secure, stable, maintainable QE4 bridge on WT32-ETH01/4 MB, not feature parity with upstream.
+
+## Status at this stacked PR head
+
+PR #3 adds the 4 MB build/dual-slot layout, IO14 non-destructive setup, unique AP credentials and provisioning-only HTTP/OTA (no normal-mode NetBIOS/SNTP). Factory erase is a separate serial-tool operation. OTA confirmation uses 30 seconds of local readiness; hardware rollback acceptance remains outstanding. Gateway-based watchdog/profile selection, synchronous MQTT and incomplete route authentication remain at this head and are addressed by stacked PR #4. The migration checklist above still requires verification; it is not a claim that every legacy behavior remains.
+
+Independent DNS provisioning, transactional validation/address-conflict safeguards, setup duration/security policy decisions and the QE4 hardware acceptance matrix remain open. See `docs/content/wt32-deployment.md`. Not hardware-tested.

@@ -1,3 +1,12 @@
+> QE4 fork: **WT32-ETH01/4 MB is the only supported target**. Build only
+> `pio run -e wt32-eth01-4mb`; verify with
+> `python scripts/check_flash_layout.py wt32-eth01-4mb 4` before flashing.
+> Read [the deployment guide](docs/content/wt32-deployment.md): HTTP/OTA is
+> provisioning-only and physical setup entry preserves settings. Not hardware-tested.
+> The retained C5/W5500 and 8 MB environments are unsupported legacy code.
+> The upstream README below is historical context; its hardware, build, tuning
+> and management instructions do not override [AGENTS.md](AGENTS.md) or this guide.
+
 # ESP32 Wi-Fi Bridge on Steroids
 
 A **transparent Layer-2 Wi-Fi ↔ Ethernet bridge** for the WT32-ETH01 — and, as a second target, an ESP32-C5 with a W5500 SPI Ethernet module (dual-band 2.4/5 GHz) — with a web portal, a JSON API, MQTT telemetry with Home Assistant autodiscovery, over-the-air updates, a self-healing watchdog, crash forensics and live performance tuning.

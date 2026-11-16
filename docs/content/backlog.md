@@ -2,7 +2,7 @@
 
 ## Deployment fork plan
 
-See [implementation-design.md](implementation-design.md) and current [AGENTS.md](../../AGENTS.md). Only WT32-ETH01/4 MB is supported. Establish the 4 MB environment/partitions before flashing, then implement provisioning-only management, local recovery and isolated outbound MQTT in stacked PRs #3/#4. Verify flash ID, power and antenna physically. Independent DNS, transactional validation/address-conflict safeguards, setup timeout policy, security tradeoffs and the full QE4 hardware acceptance matrix remain outstanding; planned work is not implemented by this documentation PR.
+Only WT32-ETH01/4 MB is supported; use current [AGENTS.md](../../AGENTS.md) and [wt32-deployment.md](wt32-deployment.md). This slice implements the 4 MB target and provisioning-only management. Stacked PR #4 handles local watchdog/profile selection, nonblocking MQTT and all-route authentication; do not duplicate that work. Remaining deployment requirements: independent DNS, transactional input validation/NVS migration and failed-save handling, IP-conflict/DHCP safeguards, setup duration and security policy decisions, confirmed flash/power/antenna, and hardware acceptance for shared-MAC IPv4/ARP, DHCP/Modbus, outages, provisioning and OTA rollback. No target hardware tests have been performed.
 
 ## Historical upstream backlog (outside QE4 scope)
 

@@ -1,6 +1,6 @@
 # Heat-pump bridge implementation design
 
-Status: proposed design; no firmware changes or hardware validation performed.
+Status: target design with an initial implementation slice; see [wt32-deployment.md](wt32-deployment.md) for implemented behavior and remaining work. Hardware validation has not been performed.
 
 This fork targets a transparent bridge for the Qvantum QE4 heat pump, with a static IPv4 telemetry endpoint and administration available only through explicit provisioning. Extend the existing ESP-IDF/PlatformIO firmware. [AGENTS.md](../../AGENTS.md) is the source of current requirements.
 
@@ -10,7 +10,7 @@ Only WT32-ETH01 with classic ESP32, LAN8720 Ethernet and 2.4 GHz Wi-Fi using a 4
 
 WT32 wiring in the existing implementation: PHY address 1, MDC GPIO23, MDIO GPIO18, PHY power GPIO16 and external RMII clock input GPIO0. GPIO14 is the proposed provisioning input; qualify the actual board wiring before use. Do not change the shared forwarding path to add another board.
 
-Before flashing, read the purchased unit with `esptool flash-id`. Do not infer its capacity from an upstream reference board. The current `wt32-eth01` environment assumes 8 MB and must not be used for this deployment. A later implementation PR must establish `wt32-eth01-4mb`, matching PlatformIO flash settings, effective sdkconfig, application/bootloader headers and a validated 4 MB partition/OTA budget. Use only that environment once available. Initial installation and partition changes require a cable; app-only OTA cannot migrate the partition table.
+Before flashing, read the purchased unit with `esptool flash-id`. Do not infer its capacity from an upstream reference board. The retained `wt32-eth01` environment assumes 8 MB and must not be used for this deployment. This slice adds `wt32-eth01-4mb`; use only that environment and verify matching PlatformIO flash settings, effective sdkconfig, application/bootloader headers and the 4 MB partition/OTA budget. Initial installation and partition changes require a cable; app-only OTA cannot migrate the partition table.
 
 Power is unresolved: verify board input specifications, regulation and isolation before connecting a supply. Do not assume the QE4 provides regulated 5 V or PoE. Antenna/enclosure modifications require physical RF and link-stability validation.
 
@@ -70,7 +70,7 @@ Build success does not demonstrate hardware compatibility or transparent forward
 
 ## Status and outstanding requirements
 
-This PR is design documentation only. PR #3 is the planned 4 MB/provisioning slice; PR #4 builds on it for local recovery, isolated MQTT and setup authentication. Neither is already implemented in this branch or main. Review their actual code and validation separately.
+PR #2 provides the design. This PR #3 slice adds the 4 MB target, non-destructive provisioning entry, unique AP credentials and provisioning-only management/OTA. PR #4 builds on it for local recovery, isolated MQTT and setup authentication; those changes are not present at this head or main. See the deployment guide for implementation limits; design sections above describe the target, not completion.
 
 Before deployment, complete independent DNS provisioning, transactional configuration validation (netmask/routing, usable addresses, MQTT port and string limits), known-client collision checks and DHCP exclusion guidance. Decide maximum setup-session duration, update/rollback acceptance and credential-storage/TLS/broker-ACL tradeoffs explicitly. Secure boot and flash encryption are not claimed enabled. Qualify QE4-relevant profiles/tuning and local driver/queue/task fault detection without treating intentional rate limiting or idle traffic as faults.
 

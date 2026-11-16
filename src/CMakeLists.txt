@@ -20,6 +20,7 @@ idf_component_register(
         esp_event
         esp_timer            # millis() in compat.h
         nvs_flash            # configuration storage
+        bootloader_support   # temporary hardware entropy for setup secret
         esp_http_server      # portal and status API
         mqtt                 # telemetry
         app_update           # OTA (esp_ota_*)

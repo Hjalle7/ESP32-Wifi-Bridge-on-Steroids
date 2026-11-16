@@ -11,7 +11,7 @@
  *  OPERATING MODES
  *  ---------------------------------------------------------------------------
  *
- *  PROVISIONING  (no SSID stored, reset pin pulled low,
+ *  PROVISIONING  (no SSID stored, setup pin held low for 3 s,
  *                 or bringing up the bridge failed)
  *      -> access point "<name>-setup-XXXX"
  *      -> http://192.168.4.1 : set name, Wi-Fi networks, management IP, MQTT
@@ -22,7 +22,7 @@
  *      2. enable promiscuous mode
  *      3. connect the Wi-Fi STA using the CLONED MAC
  *      4. attach the management netif with its static IP
- *      5. arm the data path, start the web server + MQTT
+ *      5. arm the data path and start outgoing MQTT (no web server)
  *
  *  ---------------------------------------------------------------------------
  *  WHY TWO IPs ON ONE MAC WORK
@@ -54,18 +54,17 @@
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
 #include "nvs_flash.h"
-#include "lwip/apps/netbiosns.h"
+#include "esp_wifi.h"
 
-/* Pull this pin to GND at boot for a factory reset. On the WT32-ETH01 most
- * GPIOs are taken by RMII; IO14 is free and not a strapping pin. On the
- * NiceMCU ESP32-C5 Mini, IO4 is free and not a strapping pin. The C5's BOOT
- * button (IO28) cannot serve this purpose: held during reset, it selects
- * the serial download mode. */
+/* Pull this input low for three seconds, then release, to request setup.
+ * IO14 is free on WT32; IO4 is free on C5. Neither is a boot strapping pin.
+ * This input never erases credentials. Factory erase requires serial tools. */
 #if CONFIG_IDF_TARGET_ESP32C5
-#define FACTORY_RESET_GPIO   4
+#define PROVISIONING_GPIO   4
 #else
-#define FACTORY_RESET_GPIO   14
+#define PROVISIONING_GPIO   14
 #endif
+#define PROVISIONING_HOLD_MS 3000u
 
 /* How long to wait for the first client frame before giving up and offering
  * the portal instead. Without a client MAC there is no bridge. */
@@ -114,9 +113,9 @@ static bool s_stable_reported = false;
  * esp_ota_mark_app_valid_cancel_rollback(), the bootloader reverts to the
  * previous version on the next boot.
  *
- * The criterion is deliberately NOT "has booted" but "is reachable over the
- * network" (the caller only invokes this after 30 s of uptime) - losing
- * network access is what hurts on a board installed without serial access.
+ * The caller requires 30 seconds of continuous local bridge readiness:
+ * active forwarding, Wi-Fi association and Ethernet link. This does not
+ * prove end-to-end reachability and does not depend on MQTT or client traffic.
  *
  * In portal mode it depends on why the portal is up. Without stored
  * credentials (fresh or factory-reset device) the portal IS the intended
@@ -141,26 +140,41 @@ static void ota_confirm_if_pending(void) {
   }
 }
 
-/* Check whether the factory-reset pin is held low at boot.
- *
- * Configures the pin as input with pull-up and requires it to stay low for
- * two seconds, so a glitch or a briefly touching wire does not wipe the
- * configuration. */
-static bool factory_reset_requested(void) {
+/* Initialize the setup input and recognize a deliberate boot-time hold.
+ * A hold at boot enters setup immediately after three seconds. The same
+ * pin remains configured for runtime requests, which trigger on release. */
+static bool provisioning_requested_at_boot(void) {
   gpio_config_t io = {};
-  io.pin_bit_mask = 1ULL << FACTORY_RESET_GPIO;
-  io.mode         = GPIO_MODE_INPUT;
-  io.pull_up_en   = GPIO_PULLUP_ENABLE;
-  gpio_config(&io);
+  io.pin_bit_mask = 1ULL << PROVISIONING_GPIO;
+  io.mode = GPIO_MODE_INPUT;
+  io.pull_up_en = GPIO_PULLUP_ENABLE;
+  ESP_ERROR_CHECK(gpio_config(&io));
   delay(20);
-  if (gpio_get_level((gpio_num_t)FACTORY_RESET_GPIO) != 0) return false;
-
-  printf("[BOOT] Reset pin detected, hold for 2 s...\n");
-  for (int i = 0; i < 20; i++) {
-    delay(100);
-    if (gpio_get_level((gpio_num_t)FACTORY_RESET_GPIO) != 0) return false;
+  if (gpio_get_level((gpio_num_t)PROVISIONING_GPIO)) return false;
+  const uint32_t started = millis();
+  while (!gpio_get_level((gpio_num_t)PROVISIONING_GPIO)) {
+    if (millis() - started >= PROVISIONING_HOLD_MS) return true;
+    delay(20);
   }
-  return true;
+  return false;
+}
+
+/* Poll the setup input without blocking forwarding. Trigger once on release
+ * after a three-second hold and reboot into the one-shot RTC portal mode.
+ * Mark the transition planned so it does not consume the boot-failure budget. */
+static void provisioning_button_tick(void) {
+  static bool held = false;
+  static uint32_t started = 0;
+  if (!gpio_get_level((gpio_num_t)PROVISIONING_GPIO)) {
+    if (!held) { held = true; started = millis(); }
+  } else if (held) {
+    held = false;
+    if (millis() - started >= PROVISIONING_HOLD_MS) {
+      printf("[BOOT] Setup requested; saved settings retained\n");
+      s_portal_request = PORTAL_MAGIC;
+      bridge_restart_requested();
+    }
+  }
 }
 
 /* Switch into provisioning mode: start the setup AP and the HTTP portal.
@@ -168,8 +182,11 @@ static bool factory_reset_requested(void) {
 static void enter_provisioning(const char *reason) {
   printf("[BOOT] Provisioning mode: %s\n", reason);
   s_provisioning = true;
-  portal_start_ap();
-  web_start(true);
+  if (!portal_start_ap() || !web_start(true)) {
+    printf("[BOOT] Provisioning startup failed; retrying after reboot\n");
+    delay(5000);
+    esp_restart();
+  }
 }
 
 /* One-time boot sequence (the ESP-IDF counterpart of Arduino's setup()).
@@ -235,10 +252,8 @@ static void bridge_setup(void) {
     }
   }
 
-  if (factory_reset_requested()) {
-    cfg_factory_reset();
-    printf("[BOOT] Factory reset done\n");
-    enter_provisioning("factory reset");
+  if (provisioning_requested_at_boot()) {
+    enter_provisioning("physical setup request; settings retained");
     return;
   }
 
@@ -252,7 +267,7 @@ static void bridge_setup(void) {
   }
 
   if (portal_forced) {
-    enter_provisioning("previous bridge start failed");
+    enter_provisioning("setup or recovery request");
     return;
   }
 
@@ -330,16 +345,7 @@ static void bridge_setup(void) {
   bridge_get_mgmt_ip(active_ip);
   char ip[16];
   format_ipv4(active_ip, ip, sizeof(ip));
-  printf("[BOOT] Management UI: http://%s\n", ip);
-
-  /* Wall-clock time for crash and disconnect timestamps. Ask the netif for
-   * the gateway - with several profiles it is the authoritative source. */
-  esp_netif_ip_info_t ipi = {};
-  if (esp_netif_get_ip_info(bridge_mgmt_netif(), &ipi) == ESP_OK && ipi.gw.addr) {
-    uint8_t gw[4];
-    memcpy(gw, &ipi.gw.addr, 4);
-    crashlog_time_start(gw);
-  }
+  printf("[BOOT] Telemetry IPv4: %s (no management server)\n", ip);
 
 #ifdef BRIDGE_MINIMAL
   /* Neither web server nor MQTT - that is the point of this build variant
@@ -353,67 +359,8 @@ static void bridge_setup(void) {
   printf("\n*** MINIMAL VARIANT - bridge only, no management ***\n");
   printf("*** A reboot automatically restores the full firmware ***\n\n");
 #else
-  web_start(false);
   telemetry_start();
 #endif
-}
-
-/*
- * Announce a NetBIOS name for the management interface.
- *
- * Why at all: many home routers take device names from the DHCP request
- * (option 12). The management interface has a STATIC IP by design and never
- * asks, so the router's device list shows "unknown". NetBIOS is the second
- * way such routers learn names (that is how Windows machines get named), and
- * lwIP's responder is already compiled into IDF - no component manager, no
- * new dependency.
- *
- * The name carries the last octet of the client IP, so the device list shows
- * WHOM this bridge is currently bridging - e.g. WIFIBRIDGE-109. Both
- * necessarily share one MAC, so the list shows only one entry; this way it
- * at least says what it is.
- *
- * NetBIOS allows 15 characters. The device name is shortened accordingly so
- * the suffix always fits - better a truncated name than a lost association.
- * Called from every loop iteration; it only touches the responder when the
- * resulting name changes.
- */
-static void netbios_update_name(void) {
-  static bool  init_done = false;
-  static char  current[16] = "";
-
-  if (s_provisioning || !bridge_is_active()) return;
-
-  if (!init_done) { netbiosns_init(); init_done = true; }
-
-  BridgeStats st;
-  bridge_get_stats(&st);
-
-  /* Extract the last octet of the client IP; "-" means not known yet. */
-  const char *dot = strrchr(st.client_ip, '.');
-  const char *suffix = (dot && dot[1]) ? dot + 1 : NULL;
-
-  char name[16];
-  size_t room = suffix ? 15 - 1 - strlen(suffix) : 15;   /* 1 for the hyphen */
-  size_t o = 0;
-  for (size_t i = 0; g_cfg.name[i] && o < room; i++) {
-    const char c = g_cfg.name[i];
-    if      (c >= 'a' && c <= 'z') name[o++] = c - 32;    /* NetBIOS prefers upper case */
-    else if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) name[o++] = c;
-    else if (o) name[o++] = '-';                          /* replace everything else */
-  }
-  /* Strip trailing separators, otherwise a name like "WIFIBRIDGE_1" would
-   * become the double-separated "WIFIBRIDGE--109". */
-  while (o && name[o - 1] == '-') o--;
-  if (!o) { name[o++] = 'B'; name[o++] = 'R'; name[o++] = 'I'; name[o++] = 'D'; name[o++] = 'G'; name[o++] = 'E'; }
-  if (suffix) { name[o++] = '-'; for (const char *q = suffix; *q && o < 15; q++) name[o++] = *q; }
-  name[o] = '\0';
-
-  if (strcmp(name, current) != 0) {
-    netbiosns_set_name(name);
-    strcpy(current, name);
-    printf("[NBNS] Name: %s\n", name);
-  }
 }
 
 /* One iteration of the main loop (the counterpart of Arduino's loop()),
@@ -421,7 +368,7 @@ static void netbios_update_name(void) {
  *
  * Handles OTA confirmation and the stable-boot marker in both modes; in
  * bridge mode it drives the periodic bridge/watchdog/roaming logic, the
- * NetBIOS name and MQTT telemetry; in provisioning mode it implements the
+ * setup input and MQTT telemetry; in provisioning mode it implements the
  * portal idle reboot. */
 static void bridge_loop(void) {
   /* Confirm only after 30 s. A crash shortly after boot should still lead to
@@ -429,8 +376,24 @@ static void bridge_loop(void) {
 #ifndef BRIDGE_MINIMAL
   /* Deliberately NOT confirmed in the minimal variant - see bridge_setup().
    * The missing confirmation IS the way back. */
-  if (!s_ota_confirmed && millis() > 30000 && !(s_provisioning && g_cfg.configured))
+  static bool healthy = false;
+  static uint32_t healthy_since = 0;
+  bool ready = false;
+  if (s_provisioning) {
+    ready = !g_cfg.configured;
+  } else if (bridge_is_active()) {
+    BridgeStats st;
+    bridge_get_stats(&st);
+    ready = st.wifi_up && st.eth_link;
+  }
+  if (!ready) {
+    healthy = false;
+  } else if (!healthy) {
+    healthy = true;
+    healthy_since = millis();
+  } else if (!s_ota_confirmed && millis() - healthy_since >= 30000) {
     ota_confirm_if_pending();
+  }
 #endif
 
   /* Running long enough -> reset the failed-boot counter. Only from here on
@@ -443,7 +406,7 @@ static void bridge_loop(void) {
 
   if (!s_provisioning) {
     bridge_tick();
-    netbios_update_name();
+    provisioning_button_tick();
 #ifndef BRIDGE_MINIMAL
     telemetry_tick();
 #endif
