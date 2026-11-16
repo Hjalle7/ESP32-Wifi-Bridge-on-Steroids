@@ -67,18 +67,34 @@ Scan checks include ASan/UBSan, JSON round trips and browser error recovery.
 Recovery negative controls were rejected. These checks do not validate ESP-IDF
 socket/driver timing or physical behavior.
 
-**Previously successful build:** the `217d294` correction record reports PlatformIO
-6.1.18, pinned platform 55.3.34 and ESP-IDF 5.5.1, with the supported
-`wt32-eth01-4mb` build and flash-layout checker passing. Firmware occupied
-977312 / 1966080 bytes per OTA slot (49.7%); 4 MB application/bootloader headers,
-effective Kconfig and partition bounds matched. The existing IRAM attribute warning
-remained. This is recorded prior evidence; artifacts were not rebuilt here.
+**Clean post-merge build: PASS.** The supplied verification record covers reviewed
+commit `efe21a523aa96376638065a119df863bbe5f7f27` and target
+`wt32-eth01-4mb`, using Python 3.12.14, PlatformIO 6.1.18, pinned platform
+55.3.34 and ESP-IDF 5.5.1. Firmware is 977,296 bytes of a 1,966,080-byte OTA
+slot (49.7%), leaving 988,784 bytes per slot. This supersedes the earlier build
+size and post-merge TLS blocker recorded here; no build was rerun for this
+documentation update.
 
-**Separate post-merge blocker:** the latest build attempt was reported blocked by
-PlatformIO TLS certificate verification failure. It supplies no successful
-post-merge firmware build result and does not invalidate the earlier successful
-build. The failure log/certificate cause was not independently verified here;
-this status comes from the merge handoff supplied for this review record.
+**Build-environment TLS issue: resolved.** The platform's virtual environment
+used a certifi bundle missing the environment's HTTPS proxy CA. Adding the
+existing proxy CA to the workspace-local certifi bundle resolved the failure.
+TLS certificate verification remained enabled; the fix changed no tracked
+repository files.
+
+**Flash-layout verification: PASS.** The repository flash-layout checker and
+partition-table verification passed. Artifacts verified the ESP32 target, 4 MB
+flash and DIO/80 MHz settings; image checksums and hashes are valid. OTA 0 spans
+`0x020000–0x200000` and OTA 1 spans `0x200000–0x3E0000`; end addresses are
+exclusive.
+
+**Remaining build warnings:** existing conflicting IRAM attributes on
+`is_for_mgmt` remain. Generated CMake metadata contains conflicting 40 MHz and
+single-app settings. **Use only the verified PlatformIO artifacts and flash
+offsets for flashing; do not use the conflicting CMake flashing metadata.**
+
+Hardware has not yet arrived and no hardware testing has been performed.
+Physical flash capacity must be confirmed before flashing. A passing build and
+artifact checks do not establish hardware validation or deployment readiness.
 
 ## Accepted limitations and outstanding improvements
 
