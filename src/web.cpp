@@ -19,6 +19,7 @@
  */
 
 #include "web.h"
+#include "provisioning_session.h"
 #include "config.h"
 #include "bridge.h"
 
@@ -54,6 +55,8 @@ static char s_http_basic[96] = {};
 static httpd_handle_t s_httpd = NULL;
 static bool           s_provisioning = false;
 static uint32_t       s_last_activity_ms = 0;
+static uint32_t       s_session_started_at = 0;
+static bool           s_session_configured = false;
 
 uint32_t web_last_activity_ms(void) { return s_last_activity_ms; }
 
@@ -2068,7 +2071,9 @@ static bool same_origin_request(httpd_req_t *r) {
  * authentication and origin checks; failed attempts never extend AP uptime. */
 static esp_err_t provisioning_dispatch(httpd_req_t *r) {
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
-  if (!s_provisioning || !admin_key_ok(r)) {
+  if (!s_provisioning ||
+      provisioning_session_expired(s_session_configured, s_session_started_at, millis()) ||
+      !admin_key_ok(r)) {
     httpd_resp_set_hdr(r, "WWW-Authenticate", "Basic realm=\"Bridge setup\"");
     httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "authentication required");
     return ESP_FAIL;
@@ -2543,6 +2548,9 @@ bool web_start(bool provisioning) {
     return false;
   }
   s_provisioning = true;
+  s_session_started_at = millis();
+  s_session_configured = g_cfg.configured;
+  s_last_activity_ms = s_session_started_at;
   const char *secret = g_cfg.admin_pass[0] ? g_cfg.admin_pass : s_ap_password;
   if (!secret[0] || strnlen(secret, sizeof(s_http_password)) >= sizeof(s_http_password)) return false;
   strcpy(s_http_password, secret);

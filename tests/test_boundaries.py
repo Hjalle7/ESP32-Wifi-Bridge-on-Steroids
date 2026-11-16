@@ -12,6 +12,9 @@ web = (ROOT / 'src/web.cpp').read_text()
 start = web.index('static bool admin_key_ok(')
 end = web.index('/* POST /api/update', start)
 functions = web[start:end]
+a = web.index('static esp_err_t h_root(')
+b = web.index('/* GET /api/status', a)
+root_handler = web[a:b]
 telemetry = (ROOT / 'src/telemetry.cpp').read_text()
 start = telemetry.index('struct TelemetryMessage')
 end = telemetry.index('static QueueHandle_t', start)
@@ -28,14 +31,22 @@ common = r'''
 #include <string>
 #include <vector>
 #include "provisioning_auth.h"
+#include "provisioning_session.h"
 using esp_err_t = int;
 constexpr int ESP_OK=0, ESP_FAIL=-1, HTTPD_401_UNAUTHORIZED=401, HTTPD_403_FORBIDDEN=403;
 struct httpd_req_t { std::map<std::string,std::string> headers, response; void *user_ctx; int status=200; };
 struct httpd_uri_t { void *user_ctx; esp_err_t (*handler)(httpd_req_t*); };
-static bool s_provisioning=true;
+static bool s_provisioning=true, s_session_configured=true;
+static uint32_t clock_ms=0, s_session_started_at=0, s_last_activity_ms=0;
+static uint32_t millis(){return clock_ms;}
 static char s_http_password[33]="unit-test-secret";
 static char s_http_basic[96]="Basic dW5pdC10ZXN0";
 static int calls=0;
+static const char *PAGE="setup page";
+constexpr int HTTPD_RESP_USE_STRLEN=-1;
+static void httpd_resp_set_type(httpd_req_t*,const char*){}
+static int httpd_resp_send(httpd_req_t*,const char*,int){return ESP_OK;}
+static esp_err_t h_root(httpd_req_t*);
 /* Model bounded IDF header reads, including absent/oversized headers. */
 static int httpd_req_get_hdr_value_str(httpd_req_t *r,const char *n,char *out,size_t size) {
  auto i=r->headers.find(n); if(i==r->headers.end()||i->second.size()>=size) return ESP_FAIL;
@@ -48,7 +59,7 @@ static void httpd_resp_set_hdr(httpd_req_t*r,const char*n,const char*v){r->respo
 /* Capture rejection status. */
 static void httpd_resp_send_err(httpd_req_t*r,int code,const char*){r->status=code;}
 /* A protected handler must run only after the shared gates passed. */
-static int protected_handler(httpd_req_t*r){assert(r->user_ctx==nullptr);++calls;return ESP_OK;}
+static int protected_handler(httpd_req_t*r){assert(r->user_ctx==nullptr);++calls;return h_root(r);}
 '''
 main = r'''
 /* Exercise the same dispatch used for every registered route. */
@@ -58,7 +69,9 @@ int main() {
  assert(dispatch()==ESP_FAIL && r.status==401 && calls==0);
  assert(!r.response["WWW-Authenticate"].empty());
  r.headers["X-Admin-Key"]="wrong";assert(dispatch()==ESP_FAIL && calls==0);
+ clock_ms=100;
  r.headers["X-Admin-Key"]="unit-test-secret";assert(dispatch()==ESP_OK && calls==1);
+ assert(s_last_activity_ms==100);
  r.headers.clear();r.headers["Authorization"]=s_http_basic;
  assert(dispatch()==ESP_OK && calls==2);
  r.headers["Sec-Fetch-Site"]="cross-site";assert(dispatch()==ESP_FAIL && r.status==403 && calls==2);
@@ -68,7 +81,16 @@ int main() {
  r.headers["Authorization"]=std::string(200,'x');assert(dispatch()==ESP_FAIL && r.status==401);
  r.headers.clear();r.headers["X-Admin-Key"]="unit-test-secret";s_provisioning=false;
  assert(dispatch()==ESP_FAIL && calls==3);
- puts("Provisioning authentication and origin gates passed");
+ s_provisioning=true;
+ clock_ms=PROVISIONING_MAX_SESSION_MS-1;
+ assert(dispatch()==ESP_OK && calls==4);
+ assert(s_last_activity_ms==clock_ms);
+ clock_ms=PROVISIONING_MAX_SESSION_MS;
+ assert(dispatch()==ESP_FAIL && calls==4); // even a valid key cannot extend the deadline
+ assert(s_last_activity_ms==PROVISIONING_MAX_SESSION_MS-1);
+ s_session_configured=false;
+ assert(dispatch()==ESP_OK && calls==5); // first-time setup remains available
+ puts("Provisioning authentication, origin and absolute deadline gates passed");
 }
 '''
 queue_preamble = r'''
@@ -129,7 +151,7 @@ int main(){batch();assert(s_discovery_cursor==1&&attempts.size()==2);
 """
 with tempfile.TemporaryDirectory() as directory:
     path = Path(directory)
-    for name, source in [('dispatch', common+functions+main),
+    for name, source in [('dispatch', common+root_handler+functions+main),
                          ('producer', queue_preamble+message+queue_globals+producer+queue_main),
                          ('discovery', discovery_preamble+discovery+discovery_main)]:
         unit=path/(name+'.cpp'); unit.write_text(source)

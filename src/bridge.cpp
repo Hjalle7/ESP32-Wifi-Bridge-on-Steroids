@@ -164,27 +164,9 @@ static const w5500_spi_step_t W5500_SPI_STEPS[] = {
 /* Opposite direction: Ethernet practically always accepts, drop_down stayed
  * at 0 in every measurement. Nothing to gain here. */
 #define WIFI_TX_RETRIES_DEF 1
-/* Several attempts per SSID instead of just one, before bridge_wifi_start()
- * gives up and main.cpp reboots straight into the portal.
- *
- * Reason: a single attempt does not survive two perfectly normal, transient
- * situations. First, an old association of the CLONED MAC that the AP has
- * not expired yet (802.11 reason 204: the AP still holds the old session
- * while the same MAC is already logging in again) - a quick abort() reboot
- * from the watchdog escalation (see watchdog_tick()) is exactly the case
- * most likely to produce this. Second, a short radio disturbance that has
- * not cleared yet - especially right after a watchdog reboot, whose cause
- * was by definition a Wi-Fi problem that need not have resolved itself in
- * the second until the next boot.
- *
- * Without retries a single bad moment throws the bridge into the portal
- * (192.168.4.1, invisible to every other device). This is deliberately a
- * retry of the SAME SSID, not a longer timeout: the actual problem is "wait
- * briefly and try again", not "wait longer for the same single attempt".
- *
- * 20 s / 3 attempts is a reasonable choice rather than a measured value;
- * both are overridable in the portal (g_cfg, 0 = this default). The pause
- * between attempts is deliberately fixed. */
+/* Bound the initial attempts per SSID, with pauses for transient failures.
+ * Exhaustion leaves the initialized station in normal mode; periodic retries
+ * continue without rebooting or granting provisioning authorization. */
 #define WIFI_CONNECT_TIMEOUT_MS_DEF 20000u
 #define WIFI_CONNECT_RETRIES_DEF        3
 #define WIFI_CONNECT_RETRY_DELAY_MS  2000u
@@ -870,8 +852,7 @@ static void eth_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
  *
  * On connect: records the BSSID, closes open disconnect-log entries and
  * (re)installs our RX callback. On disconnect: logs the event and, while the
- * bridge is active, reconnects immediately - this is the single place that
- * reconnects, which the watchdog and roaming rely on. */
+ * bridge is active, leaves reconnect pacing to the normal-mode tick. */
 /* Defined with the network slot logic further down (see sta_lock_ap()). */
 static void sta_release_lock_on_disconnect(void);
 static void last_ap_note(const uint8_t bssid[6], uint8_t channel);
@@ -906,11 +887,10 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     disc_log_add(d, was_up);
     /* A BSSID binding (sta_lock_ap()) holds for one connection only: release
      * it on the first disconnect that is not our own roaming switch, so the
-     * reconnect below may pick any AP of the SSID again. */
+     * next retry may pick any AP of the SSID again. */
     sta_release_lock_on_disconnect();
-    /* In operation, keep reconnecting - but not while esp_restart() is
-     * stopping the driver, where a connect would race the shutdown. */
-    if (s_active && !s_restarting) esp_wifi_connect();
+    /* bridge_tick() rate-limits retries; an association failure is not
+     * physical authorization to open provisioning. */
   }
 }
 
@@ -1754,8 +1734,10 @@ bool bridge_wifi_start(void) {
     esp_wifi_disconnect();
   }
   esp_log_level_set("wifi", ESP_LOG_WARN);
-  esp_wifi_stop();
-  return false;
+  /* Driver/netif are ready even when association failed. Normal-mode ticks
+   * continue bounded reconnects; never rebuild the stack or request setup. */
+  printf("[WIFI] Initial association exhausted; retrying in normal mode\n");
+  return true;
 }
 
 /* Arm the data path: route Ethernet frames to eth_rx_cb and start
@@ -1767,6 +1749,7 @@ void bridge_activate(void) {
 }
 
 bool bridge_is_active(void) { return s_active; }
+bool bridge_client_mac_known(void) { return s_mac_known; }
 esp_netif_t *bridge_mgmt_netif(void) { return s_mgmt_netif; }
 void bridge_get_mgmt_ip(uint8_t out[4]) { memcpy(out, s_mgmt_ip, 4); }
 
@@ -3067,9 +3050,7 @@ static void watchdog_tick(void) {
   if (next == WD_STAGE_WIFI_RECONNECT) {
     /* Either a Wi-Fi-side symptom (straight here), or an Ethernet reset in
      * the previous round did not help - either way, disconnect Wi-Fi now.
-     * wifi_evt() reconnects automatically on WIFI_EVENT_STA_DISCONNECTED
-     * (s_active is always set here); an extra esp_wifi_connect() would be
-     * redundant. */
+     * The paced normal-mode retry tick reconnects after disconnection. */
     printf("[WD  ] Disconnecting Wi-Fi to reconnect\n");
     if (s_wifi_up) {
       disc_mark_own(DISC_SRC_WATCHDOG);
@@ -3393,10 +3374,22 @@ uint32_t bridge_thermal_limit_kbps(void) { return s_thr_kbps; }
 /* See bridge.h. */
 uint32_t bridge_thermal_drops(void) { return s_drop_thr; }
 
+/* Called only in normal mode. At most one connect request per five seconds,
+ * including immediate authentication failures; never reconnect in callbacks. */
+static void wifi_retry_tick(void) {
+  static uint32_t last_attempt = 0;
+  if (!s_active || s_restarting || s_wifi_up) return;
+  const uint32_t now = millis();
+  if (now - last_attempt < 5000u) return;
+  last_attempt = now;
+  esp_wifi_connect();
+}
+
 /* Periodic work, called from the main loop: run the autotune, watchdog and
  * roaming state machines, and once per second recompute the throughput in
  * kbit/s from the byte counters. */
 void bridge_tick(void) {
+  wifi_retry_tick();
   autotune_tick();
   txp_tune_tick();
   cap_tune_tick();

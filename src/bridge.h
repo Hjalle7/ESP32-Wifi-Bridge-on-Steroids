@@ -102,10 +102,13 @@ bool bridge_sniff_client_mac(uint32_t timeout_ms);
 
 /* Bring up Wi-Fi in STA mode with the cloned client MAC, including the
  * management netif with its static IP. Tries all configured SSIDs in order.
- * Returns false if none of them could be connected. */
+ * Returns true once initialized, even if association is still pending.
+ * Normal-mode ticks retry association without exposing management services. */
 bool bridge_wifi_start(void);
 
-/* Arm the data path (call only after a successful connect). */
+bool bridge_client_mac_known(void);
+
+/* Arm the data path after Wi-Fi initialization (association may be pending). */
 void bridge_activate(void);
 
 /* Must be called periodically from the main loop - drives the autotune,

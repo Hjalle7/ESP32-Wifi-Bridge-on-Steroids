@@ -11,8 +11,8 @@
  *  OPERATING MODES
  *  ---------------------------------------------------------------------------
  *
- *  PROVISIONING  (no SSID stored, setup pin held low for 3 s,
- *                 or bringing up the bridge failed)
+ *  PROVISIONING  (not configured, setup pin held low for 3 s,
+ *                 or a one-shot physical setup request)
  *      -> access point "<name>-setup-XXXX"
  *      -> http://192.168.4.1 : set name, Wi-Fi networks, management IP, MQTT
  *      -> saving triggers a reboot
@@ -49,6 +49,7 @@
 #include "telemetry.h"
 #include "crashlog.h"
 #include "conlog.h"
+#include "provisioning_session.h"
 
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -66,44 +67,28 @@
 #endif
 #define PROVISIONING_HOLD_MS 3000u
 
-/* How long to wait for the first client frame before giving up and offering
- * the portal instead. Without a client MAC there is no bridge. */
+/* Bound the initial client-MAC wait. Failure never authorizes setup. */
 #define MAC_SNIFF_TIMEOUT_MS 60000
 
 static bool s_provisioning = false;
 static bool s_ota_confirmed = false;
 
-/*
- * "Boot into the portal" request that survives a software reset.
- *
- * RTC_NOINIT_ATTR means: preserved across esp_restart(), but undefined after
- * a real power-on - hence the magic word. That is exactly the behavior we
- * want: after a failed bridge start the next boot goes straight to the
- * portal, but a power cycle tries the bridge again normally (e.g. because the
- * AP is back by then).
- */
+/* One-shot physical authorization, written only by provisioning_button_tick().
+ * Consume only on its requested software reboot; faults cannot authorize setup. */
 #define PORTAL_MAGIC 0x50525450u   /* "PRTP" */
 RTC_NOINIT_ATTR static uint32_t s_portal_request;
+/* A continuously held pin is one authorization, even across session expiry. */
+RTC_NOINIT_ATTR static uint32_t s_setup_held;
+#define SETUP_HELD_MAGIC 0x48454c44u
 
-/*
- * Boot-loop protection.
- *
- * The portal request above only covers a Wi-Fi bring-up that fails cleanly.
- * A crash DURING operation - e.g. because someone set the buffers so high
- * that the heap runs out - instead causes reboot, crash, reboot: an endless
- * loop that cannot be escaped without a serial cable.
- *
- * So we count boots that never reached "stable". After three such boots the
- * board enters the portal, where the offending setting can be corrected. The
- * counter lives in RTC memory: it survives a software reset but not pulling
- * the plug - a real power-on should start over without prejudice.
- */
+/* Failed boots are diagnostic only; recovery never authorizes provisioning. */
 #define BOOT_MAGIC   0x424f4f54u   /* "BOOT" */
-#define BOOT_MAX_FAILED_BOOTS 3
 #define BOOT_STABLE_MS        60000  /* uptime needed for a boot to count as stable */
 RTC_NOINIT_ATTR static uint32_t s_boot_magic;
 RTC_NOINIT_ATTR static uint32_t s_boot_failures;
 static bool s_stable_reported = false;
+static uint32_t s_provisioning_started_at = 0;
+static bool s_provisioning_configured = false;
 
 /*
  * Confirm a freshly flashed OTA image so it is not rolled back.
@@ -117,14 +102,9 @@ static bool s_stable_reported = false;
  * active forwarding, Wi-Fi association and Ethernet link. This does not
  * prove end-to-end reachability and does not depend on MQTT or client traffic.
  *
- * In portal mode it depends on why the portal is up. Without stored
- * credentials (fresh or factory-reset device) the portal IS the intended
- * state, so the image is confirmed. WITH stored credentials, the portal
- * means this firmware could not get the bridge onto the network that the
- * previous one served - so it is deliberately left unconfirmed: the
- * validation deadline then rolls back to the previous image instead of looping
- * between a failed connect and the portal with a broken firmware that
- * confirmed itself.
+ * Initial setup without saved configuration is an intended healthy state.
+ * Physical setup on a configured device does not validate bridge readiness;
+ * the deadline can roll back without granting further provisioning access.
  */
 /* Allow normal startup and brief outages without extending validation forever.
  * The window starts after blocking setup has completed; all timing is wrap-safe. */
@@ -179,10 +159,17 @@ static bool provisioning_requested_at_boot(void) {
   io.pull_up_en = GPIO_PULLUP_ENABLE;
   ESP_ERROR_CHECK(gpio_config(&io));
   delay(20);
-  if (gpio_get_level((gpio_num_t)PROVISIONING_GPIO)) return false;
+  if (gpio_get_level((gpio_num_t)PROVISIONING_GPIO)) {
+    s_setup_held = 0;
+    return false;
+  }
+  if (s_setup_held == SETUP_HELD_MAGIC) return false;
   const uint32_t started = millis();
   while (!gpio_get_level((gpio_num_t)PROVISIONING_GPIO)) {
-    if (millis() - started >= PROVISIONING_HOLD_MS) return true;
+    if (millis() - started >= PROVISIONING_HOLD_MS) {
+      s_setup_held = SETUP_HELD_MAGIC;
+      return true;
+    }
     delay(20);
   }
   return false;
@@ -194,6 +181,11 @@ static bool provisioning_requested_at_boot(void) {
 static void provisioning_button_tick(void) {
   static bool held = false;
   static uint32_t started = 0;
+  if (s_setup_held == SETUP_HELD_MAGIC) {
+    held = false;
+    if (gpio_get_level((gpio_num_t)PROVISIONING_GPIO)) s_setup_held = 0;
+    return;
+  }
   if (!gpio_get_level((gpio_num_t)PROVISIONING_GPIO)) {
     if (!held) { held = true; started = millis(); }
   } else if (held) {
@@ -210,10 +202,13 @@ static void provisioning_button_tick(void) {
  * `reason` is only logged. Ethernet bridging is not attempted in this mode. */
 static void enter_provisioning(const char *reason) {
   printf("[BOOT] Provisioning mode: %s\n", reason);
+  s_provisioning_started_at = millis();
+  s_provisioning_configured = g_cfg.configured;
   s_provisioning = true;
   if (!portal_start_ap() || !web_start(true)) {
     printf("[BOOT] Provisioning startup failed; retrying after reboot\n");
     delay(5000);
+    s_portal_request = 0;
     esp_restart();
   }
 }
@@ -243,23 +238,12 @@ static void bridge_setup(void) {
 
   cfg_load();
 
-  /* Evaluate once and clear immediately - otherwise a single failed attempt
-   * would leave the board stuck in the portal for good. */
+  /* Physical authorization is one-shot, including across faults. */
   const bool portal_forced = (s_portal_request == PORTAL_MAGIC);
   s_portal_request = 0;
 
-  /* Count failed boots. On the very first power-on RTC memory is undefined;
-   * the missing magic word identifies that case. */
-  bool too_many_failures = false;
-
-  /* Exception: a boot caused by a deliberate watchdog restart (bridge.cpp,
-   * highest escalation level) does NOT count as a failed boot - the device
-   * booted and ran fine, it only restarted itself for Wi-Fi health reasons.
-   * Without this exception, several watchdog restarts during a longer Wi-Fi
-   * outage would trip the boot-loop protection, which is meant for something
-   * else entirely. Must be evaluated BEFORE the power-on branch below,
-   * otherwise the one-shot magic word would be cleared without being
-   * consumed. */
+  /* Planned recovery and user-requested resets do not count as failed boots.
+   * These markers are diagnostic; neither grants provisioning authorization. */
   const bool planned_restart = bridge_consume_planned_restart();
   /* The same for a reboot someone asked for (/api/reboot, OTA). */
   const bool requested_restart = bridge_consume_requested_restart();
@@ -274,11 +258,7 @@ static void bridge_setup(void) {
   } else if (planned_restart || requested_restart) {
     /* s_boot_failures stays unchanged. */
   } else {
-    s_boot_failures++;
-    if (s_boot_failures >= BOOT_MAX_FAILED_BOOTS) {
-      too_many_failures = true;
-      s_boot_failures = 0;      /* one-shot, otherwise it would stick forever */
-    }
+    if (s_boot_failures != UINT32_MAX) ++s_boot_failures;
   }
 
   if (provisioning_requested_at_boot()) {
@@ -286,38 +266,27 @@ static void bridge_setup(void) {
     return;
   }
 
-  if (too_many_failures) {
-    /* Rebooted several times without ever running stably. Trying again would
-     * just continue the loop - go to the portal instead, where the cause can
-     * be fixed. */
-    printf("[BOOT] Several boots without stable operation\n");
-    enter_provisioning("repeated reboots - check settings");
+  if (portal_forced && requested_restart && esp_reset_reason() == ESP_RST_SW) {
+    enter_provisioning("physical setup request; settings retained");
     return;
   }
 
-  if (portal_forced) {
-    enter_provisioning("setup or recovery request");
-    return;
-  }
-
-  if (!g_cfg.configured || g_cfg.ssid1[0] == '\0') {
-    enter_provisioning("no Wi-Fi credentials stored");
+  if (!g_cfg.configured) {
+    enter_provisioning("initial setup");
     return;
   }
 
   /* --- Bridge mode ------------------------------------------------------- */
   if (!bridge_eth_init()) {
-    printf("[BOOT] Ethernet init failed - rebooting in 5 s\n");
-    delay(5000);
-    esp_restart();
+    printf("[BOOT] Ethernet init failed; management stays disabled, use setup GPIO\n");
+    return;
   }
 
   /* Determine the client MAC.
    *
    * Sniffing alone is not enough: it waits for a frame from the client, and
-   * some clients (e.g. IP cameras) only send while THEY boot. If only the
-   * bridge restarts (reboot, OTA), nothing arrives and the board would end up
-   * in the portal, unreachable.
+   * some clients only send while they boot. After a bridge restart or OTA,
+   * a quiet client must not prevent startup with its previously learned MAC.
    *
    * Therefore a MAC learned once is stored in NVS and used as a fallback. The
    * sniff still runs so that a DEVICE CHANGE is noticed.
@@ -345,25 +314,24 @@ static void bridge_setup(void) {
   } else if (have_mac) {
     bridge_set_client_mac(stored_mac);
   } else {
-    /* Never seen a client - the portal is the only option left. */
-    enter_provisioning("no client detected on the Ethernet port");
-    return;
+    /* Keep waiting without opening management services.
+     * The sniff driver is already running; the receive callback keeps learning.
+     * GPIO and OTA validation remain live while the client is absent. */
+    while (!bridge_client_mac_known()) {
+      provisioning_button_tick();
+      ota_validation_tick(false);
+      delay(50);
+    }
+    uint8_t learned[6];
+    bridge_get_client_mac(learned);
+    memcpy(g_cfg.client_mac, learned, 6);
+    cfg_save();
+    bridge_set_client_mac(learned);
   }
 
   if (!bridge_wifi_start()) {
-    /* Do NOT switch to the portal directly. bridge_wifi_start() has already
-     * initialized the Wi-Fi stack and created a STA netif; portal_start_ap()
-     * would create both again, and esp_netif_create_default_wifi_sta()
-     * reports a duplicate if_key not with an error code but with an assert -
-     * a boot loop in which the portal never appears, exactly the state that
-     * cannot be escaped without serial access.
-     *
-     * Rather than tearing down half the stack by hand (many failure modes,
-     * itself untested), force a clean reboot straight into the portal. */
-    printf("[BOOT] Wi-Fi failed - rebooting straight into the portal\n");
-    s_portal_request = PORTAL_MAGIC;
-    delay(200);            /* let the log output drain */
-    esp_restart();
+    printf("[BOOT] Wi-Fi initialization failed; management stays disabled, use setup GPIO\n");
+    return;
   }
 
   bridge_activate();
@@ -398,7 +366,7 @@ static void bridge_setup(void) {
  * Handles OTA confirmation and the stable-boot marker in both modes; in
  * bridge mode it drives the periodic bridge/watchdog/roaming logic, the
  * setup input and MQTT telemetry; in provisioning mode it implements the
- * portal idle reboot. */
+ * inactivity and absolute provisioning deadlines. */
 static void bridge_loop(void) {
   /* Confirm only after 30 s. A crash shortly after boot should still lead to
    * a rollback - that is why this is not done right away in setup. */
@@ -425,12 +393,12 @@ static void bridge_loop(void) {
   }
 
   if (!s_provisioning) {
-    bridge_tick();
+    if (bridge_is_active()) bridge_tick();
     provisioning_button_tick();
 #ifndef BRIDGE_MINIMAL
     telemetry_tick();
 #endif
-  } else if (g_cfg.configured) {
+  } else if (s_provisioning_configured) {
     /* Portal mode: after a while without active portal use, try an ordinary
      * reboot on our own - see config.h: ap_idle_reboot_s. Only with stored
      * credentials (g_cfg.configured), otherwise a fresh or factory-reset
@@ -440,11 +408,14 @@ static void bridge_loop(void) {
      * would prevent the reboot forever. */
     const uint32_t threshold_ms =
         (g_cfg.ap_idle_reboot_s ? g_cfg.ap_idle_reboot_s : AP_IDLE_REBOOT_S_DEF) * 1000UL;
-    if (millis() - web_last_activity_ms() >= threshold_ms) {
-      printf("[BOOT] %lu s without portal use - trying a reboot with the stored credentials\n",
-             (unsigned long)(threshold_ms / 1000));
-      delay(200);
-      esp_restart();
+    if (provisioning_session_expired(s_provisioning_configured, s_provisioning_started_at, millis()) ||
+        millis() - web_last_activity_ms() >= threshold_ms) {
+      printf("[BOOT] Provisioning session expired (idle or absolute deadline)\n");
+      /* Stop the radio first: HTTP/OTA connections cannot prolong shutdown.
+       * Reboot rebuilds the bridge stack without AP/STA netif reuse hazards. */
+      s_portal_request = 0;
+      esp_wifi_stop();
+      bridge_restart_requested();
     }
   }
   delay(50);
