@@ -235,6 +235,8 @@ static volatile uint32_t s_drop_e2w = 0, s_drop_w2e = 0;
 /* Written only by eth_rx_cb after failed Wi-Fi transmit attempts. Keep
  * policy/offline drops in s_drop_e2w for telemetry, not fault recovery. */
 static volatile uint32_t s_fail_e2w = 0;
+/* Failed Ethernet driver calls only; offline drops remain telemetry. */
+static volatile uint32_t s_fail_w2e = 0;
 static volatile uint64_t s_by_e2w = 0, s_by_w2e = 0;
 static uint32_t s_kbps_e2w = 0, s_kbps_w2e = 0;
 
@@ -821,6 +823,7 @@ IRAM_ATTR static esp_err_t wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
     const uint8_t retries = s_wifi_tx_retries;
     for (int i = 0; i < retries; i++) {
       err = esp_eth_transmit(s_eth, buffer, len);
+      if (err != ESP_OK) s_fail_w2e = s_fail_w2e + 1;
       /* Do not sleep after the last attempt: this is the Wi-Fi task, and
        * with the default of 1 retry every drop would block it for a full
        * tick for no benefit at all. */
@@ -2989,7 +2992,7 @@ static void watchdog_tick(void) {
   if (s_wd_t0 == 0) {
     s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_fail_e2w;
     s_wd_disc0 = s_wifi_disc_count;
-    s_wd_eth_pkt0 = s_pkt_w2e; s_wd_eth_drop0 = s_drop_w2e;
+    s_wd_eth_pkt0 = s_pkt_w2e; s_wd_eth_drop0 = s_fail_w2e;
     return;
   }
   if (now - s_wd_t0 < WD_WINDOW_MS) return;
@@ -3001,8 +3004,8 @@ static void watchdog_tick(void) {
   s_wd_disc0 = s_wifi_disc_count;
 
   const uint32_t ep = s_pkt_w2e - s_wd_eth_pkt0;
-  const uint32_t ed = s_drop_w2e - s_wd_eth_drop0;
-  s_wd_eth_pkt0 = s_pkt_w2e; s_wd_eth_drop0 = s_drop_w2e;
+  const uint32_t ed = s_fail_w2e - s_wd_eth_drop0;
+  s_wd_eth_pkt0 = s_pkt_w2e; s_wd_eth_drop0 = s_fail_w2e;
   s_wd_probe = 0;  /* legacy field: no active probe */
   const uint8_t reason = local_watchdog_reason(s_eth_link, s_wifi_up, dp, dd, ep, ed, ddisc);
   const bool bad = reason != WD_REASON_NONE;

@@ -121,20 +121,49 @@ static bool s_stable_reported = false;
  * credentials (fresh or factory-reset device) the portal IS the intended
  * state, so the image is confirmed. WITH stored credentials, the portal
  * means this firmware could not get the bridge onto the network that the
- * previous one served - so it is deliberately left unconfirmed: the portal
- * idle reboot then rolls back to the previous image instead of looping
+ * previous one served - so it is deliberately left unconfirmed: the
+ * validation deadline then rolls back to the previous image instead of looping
  * between a failed connect and the portal with a broken firmware that
  * confirmed itself.
  */
-static void ota_confirm_if_pending(void) {
+/* Allow normal startup and brief outages without extending validation forever.
+ * The window starts after blocking setup has completed; all timing is wrap-safe. */
+#define OTA_VALIDATION_DEADLINE_MS 180000u
+#define OTA_READY_STABLE_MS         30000u
+static void ota_validation_tick(bool ready) {
   if (s_ota_confirmed) return;
+  static bool started = false, healthy = false, pending = false;
+  static uint32_t started_at = 0, healthy_since = 0;
+  const uint32_t now = millis();
+  if (!started) { started = true; started_at = now; }
 
-  const esp_partition_t *run = esp_ota_get_running_partition();
-  esp_ota_img_states_t st;
-  if (esp_ota_get_state_partition(run, &st) != ESP_OK) return;
-  if (st != ESP_OTA_IMG_PENDING_VERIFY) { s_ota_confirmed = true; return; }
+  if (!pending) {
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    esp_ota_img_states_t st;
+    if (!run || esp_ota_get_state_partition(run, &st) != ESP_OK) return;
+    if (st != ESP_OTA_IMG_PENDING_VERIFY) { s_ota_confirmed = true; return; }
+    pending = true;
+  }
 
-  if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+  /* Deadline wins even if readiness first becomes stable on this tick. */
+  if (now - started_at >= OTA_VALIDATION_DEADLINE_MS) {
+    printf("[OTA ] Validation deadline expired - rolling back\n");
+    const esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
+    /* Success never returns. On failure, leave the image unconfirmed and
+     * reboot: the rollback-enabled bootloader rejects PENDING_VERIFY on
+     * the next boot. Never confirm an image to recover from an API error. */
+    printf("[OTA ] Rollback returned %s - restarting unconfirmed\n", esp_err_to_name(err));
+    delay(200);
+    esp_restart();
+    return;
+  }
+  if (!ready) {
+    healthy = false;
+  } else if (!healthy) {
+    healthy = true;
+    healthy_since = now;
+  } else if (now - healthy_since >= OTA_READY_STABLE_MS &&
+             esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
     s_ota_confirmed = true;
     printf("[OTA ] New firmware confirmed, no rollback\n");
   }
@@ -376,8 +405,6 @@ static void bridge_loop(void) {
 #ifndef BRIDGE_MINIMAL
   /* Deliberately NOT confirmed in the minimal variant - see bridge_setup().
    * The missing confirmation IS the way back. */
-  static bool healthy = false;
-  static uint32_t healthy_since = 0;
   bool ready = false;
   if (s_provisioning) {
     ready = !g_cfg.configured;
@@ -386,14 +413,7 @@ static void bridge_loop(void) {
     bridge_get_stats(&st);
     ready = st.wifi_up && st.eth_link;
   }
-  if (!ready) {
-    healthy = false;
-  } else if (!healthy) {
-    healthy = true;
-    healthy_since = millis();
-  } else if (!s_ota_confirmed && millis() - healthy_since >= 30000) {
-    ota_confirm_if_pending();
-  }
+  ota_validation_tick(ready);
 #endif
 
   /* Running long enough -> reset the failed-boot counter. Only from here on

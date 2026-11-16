@@ -14,6 +14,8 @@ tick=s[a:b]
 # Exercise the real policy-drop and transmit branches, without packet parsing.
 a=s.index('  /* Queue cap:');b=s.index('\n/*\n * Does this frame belong', a)
 forwarding=s[a:b]
+a=s.index('IRAM_ATTR static esp_err_t wifi_rx_cb(');b=s.index('/* Ethernet input callback',a)
+ethernet=s[a:b]
 preamble=r'''
 #include <cstdint>
 #include <cstdio>
@@ -29,7 +31,7 @@ preamble=r'''
 #define DISC_SRC_WATCHDOG 1
 static uint32_t clock_ms=100,s_wd_reason_magic=0;
 static bool s_active=true,s_paused=false,s_eth_link=true,s_wifi_up=true;
-static uint32_t s_pkt_e2w=0,s_drop_e2w=0,s_pkt_w2e=0,s_drop_w2e=0,s_wifi_disc_count=0,s_fail_e2w=0;
+static uint32_t s_pkt_e2w=0,s_drop_e2w=0,s_pkt_w2e=0,s_drop_w2e=0,s_wifi_disc_count=0,s_fail_e2w=0,s_fail_w2e=0;
 struct Config{bool wd_enable=true;uint8_t bad=1,actions=7;}g_cfg;
 static unsigned ethernet_resets=0,reconnects=0,reboots=0;
 struct Reboot{};
@@ -73,11 +75,25 @@ static void eth_tx_retry_wait(){}
 static int forward(uint32_t len=1000){
  uint8_t *buffer=static_cast<uint8_t*>(malloc(len));assert(buffer);
 '''
+ethernet_preamble=r'''
+#define IRAM_ATTR
+#define BRIDGE_MINIMAL
+static void *s_eth=(void*)1;
+static uint8_t s_wifi_tx_retries=1;
+static uint64_t s_by_w2e=0;
+static unsigned eth_calls=0,rx_frees=0;
+static unsigned transient_eth_failures=0;
+static int esp_eth_transmit(void*,void*,uint16_t){++eth_calls;if(transient_eth_failures){--transient_eth_failures;return ESP_FAIL;}return tx_result;}
+static void vTaskDelay(int){}
+static void esp_wifi_internal_free_rx_buffer(void*){++rx_frees;}
+static esp_err_t wifi_rx_cb(void*,uint16_t,void*);
+static void receive_eth(){uint8_t frame[14]{};wifi_rx_cb(frame,14,frame);}
+'''
 main=r'''
 /* Reset volatile state while optionally preserving the reboot budget. */
 static void reset(bool preserve=false){
  clock_ms=100;s_active=true;s_paused=false;s_eth_link=true;s_wifi_up=true;
- s_pkt_e2w=s_drop_e2w=s_pkt_w2e=s_drop_w2e=s_wifi_disc_count=s_fail_e2w=0;
+ s_pkt_e2w=s_drop_e2w=s_pkt_w2e=s_drop_w2e=s_wifi_disc_count=s_fail_e2w=s_fail_w2e=0;
  s_txq_cap=0;s_thr_kbps=0;s_drop_cap=s_drop_thr=0;s_thr_tokens=0;
  s_eth_tx_retries=1;queue_depth=0;tx_result=ESP_OK;tx_calls=0;
  s_wd_t0=s_wd_pkt0=s_wd_drop0=s_wd_disc0=s_wd_eth_pkt0=s_wd_eth_drop0=0;
@@ -88,7 +104,7 @@ static void reset(bool preserve=false){
 }
 /* Advance one window, optionally injecting actual transmit-error evidence. */
 static bool window(bool errors=false){
- clock_ms+=20000;if(errors){s_pkt_w2e+=170;s_drop_w2e+=30;}
+ clock_ms+=20000;if(errors){s_pkt_w2e+=170;s_drop_w2e+=30;s_fail_w2e+=30;}
  try{watchdog_tick();return false;}catch(Reboot&){++reboots;return true;}
 }
 /* Exercise quiet/cable/AP outages, cooldowns, symptom changes and reboot caps. */
@@ -161,6 +177,35 @@ int main(){
  tx_result=ESP_FAIL;for(int j=0;j<30;++j)forward();
  tx_result=ESP_OK;for(int j=0;j<170;++j)forward();
  assert(!window());assert(reconnects==1);
+ // Actual Ethernet receive path: cable loss and return inside one watchdog
+ // window must not turn offline telemetry drops into a driver fault.
+ reset();eth_calls=rx_frees=0;s_eth_link=false;
+ for(int j=0;j<1000;++j)receive_eth();
+ assert(s_drop_w2e==1000&&s_fail_w2e==0&&eth_calls==0&&rx_frees==1000);
+ s_eth_link=true;assert(!window());
+ for(int j=0;j<400;++j)receive_eth();
+ assert(!window());assert(!ethernet_resets&&!reconnects);
+ // Entire windows offline, then recovery, also stay below escalation.
+ reset();s_eth_link=false;
+ for(int i=0;i<12;++i){for(int j=0;j<200;++j)receive_eth();assert(!window());}
+ s_eth_link=true;assert(!window());assert(!ethernet_resets&&!reconnects);
+ // Paused/inactive/missing-driver drops are not driver calls either.
+ reset();s_active=false;receive_eth();s_active=true;s_eth=nullptr;receive_eth();
+ s_eth=(void*)1;s_paused=true;receive_eth();s_paused=false;
+ assert(s_fail_w2e==0&&s_drop_w2e==2);
+ // Real Ethernet failures retain the exact threshold and retry evidence.
+ for(int failures:{29,30}){
+  reset();for(int j=0;j<200;++j){tx_result=j<failures?ESP_FAIL:ESP_OK;receive_eth();}
+  assert(s_fail_w2e==(unsigned)failures&&s_drop_w2e==(unsigned)failures);
+  assert(!window());assert(ethernet_resets==(failures==30?1u:0u));
+ }
+ reset();s_wifi_tx_retries=3;eth_calls=0;transient_eth_failures=1;receive_eth();
+ assert(eth_calls==2&&s_fail_w2e==1&&s_pkt_w2e==1&&s_drop_w2e==0);
+ reset();s_wifi_tx_retries=3;eth_calls=0;tx_result=ESP_FAIL;receive_eth();
+ assert(eth_calls==3&&s_fail_w2e==3&&s_drop_w2e==1);s_wifi_tx_retries=1;
+ reset();s_fail_w2e=UINT32_MAX-15;s_wd_eth_drop0=s_fail_w2e;
+ for(int j=0;j<200;++j){tx_result=j<30?ESP_FAIL:ESP_OK;receive_eth();}
+ assert(!window());assert(ethernet_resets==1);
  reset();g_cfg.bad=255;
  for(int i=0;i<254;++i){assert(!window(true));}
  assert(ethernet_resets==0);
@@ -169,7 +214,7 @@ int main(){
 }
 '''
 with tempfile.TemporaryDirectory() as directory:
-    path=Path(directory);(path/'watchdog.cpp').write_text(preamble+policy+globals_+tick+forwarding_preamble+forwarding+main)
+    path=Path(directory);(path/'watchdog.cpp').write_text(preamble+policy+globals_+tick+forwarding_preamble+forwarding+ethernet_preamble+ethernet+main)
     binary=path/'watchdog'
     subprocess.run(['g++','-std=c++17','-Wall','-Wextra','-I'+str(ROOT/'src'),str(path/'watchdog.cpp'),'-o',str(binary)],check=True)
     result=subprocess.run([str(binary)],check=True,capture_output=True,text=True)
