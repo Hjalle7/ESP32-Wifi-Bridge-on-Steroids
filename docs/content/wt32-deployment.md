@@ -24,18 +24,23 @@ Power and antenna choices remain unresolved. Verify board input specifications, 
 
 ## Remaining work
 
-This is not the completed production architecture. PR #4 removes gateway probes, isolates outbound MQTT and authenticates all registered provisioning routes; see [local-recovery-and-access.md](local-recovery-and-access.md). Independent DNS, transactional configuration/address validation, security tradeoffs and maximum setup duration remain open. The serial factory-erase path remains separate from non-destructive provisioning; a portal reset action is optional. No outbound-only firewall or hardware-verified zero listening ports is claimed.
+This is not the completed production architecture. PR #4 removes gateway probes, isolates outbound MQTT and authenticates all registered provisioning routes; see [local-recovery-and-access.md](local-recovery-and-access.md). Independent DNS, transactional configuration/address validation, security tradeoffs and hardware acceptance remain open. Configured setup has an absolute 30-minute deadline as well as inactivity expiry; see [security-review.md](security-review.md). The serial factory-erase path remains separate from non-destructive provisioning; a portal reset action is optional. No outbound-only firewall or hardware-verified zero listening ports is claimed.
 
 Before deployment, test DHCP/ARP and bidirectional Modbus, MAC replacement, physical setup without data loss, unique-secret persistence and serial-only visibility, broker outage, cable/Wi-Fi recovery, OTA rollback (including link loss), antenna/power stability and an unattended soak. See [implementation-design.md](implementation-design.md) for the remaining design and acceptance criteria.
 
 ## Build verification
 
-The original implementation reported a WT32 4 MB build on the pinned PlatformIO platform/ESP-IDF 5.5.1: 968720 bytes (49.3% of a 1966080-byte slot). It reported matching bootloader/app headers, Kconfig size, generated partition bounds and app fit, plus rejection of wrong-size headers, oversized apps and out-of-bounds partitions. This is prior build evidence, not a new build or hardware verification. Rebuild/check only `wt32-eth01-4mb` after firmware changes. An existing IRAM declaration warning remains.
-
-PR #4 final-review fixes were rebuilt for `wt32-eth01-4mb` using the pinned platform/ESP-IDF 5.5.1 and its PlatformIO Core 6.1.18. The artifact checker passed: 4 MB app/bootloader headers, effective flash configuration, generated partition bounds and 969488 / 1966080 bytes per OTA slot (49.3%); rollback is enabled in the generated configuration. All five host suites passed (`test_runtime_policies.cpp`, `test_boundaries.py`, `test_config_layout.py`, `test_watchdog.py`, `test_ota.py`). New cases cover OTA success/deadline/flapping/temporary outages/API errors/timer wrap, Ethernet offline/recovery within and across watchdog windows, driver retries and counter wrap. Negative controls disabling the deadline or restoring Ethernet total-drop classification failed as expected. The existing IRAM declaration warning remains. Not hardware-tested.
+The clean post-merge `wt32-eth01-4mb` build and flash-layout verification passed.
+See [Security review: verification and build status](security-review.md#verification-and-build-status)
+for the reviewed commit, tool versions, image/slot sizes, verified offsets and
+remaining warnings. Use only the verified PlatformIO artifacts and flash offsets;
+do not use generated CMake flashing metadata, which contains conflicting flash
+clock and single-app settings. Rebuild/check only `wt32-eth01-4mb` after firmware
+changes. No hardware testing has been performed; confirm physical flash capacity
+before flashing. Deployment readiness has not been established.
 
 ## Acceptance still required
 
-Provision and validate DNS independently of the gateway; reject malformed/non-unicast addresses, invalid masks/routes/ports and known client-IP collisions; document DHCP exclusions and safe configuration migration/failed saves. Review broker ACLs, TLS/trusted-time and credential storage (secure boot/flash encryption are not claimed). Define whether an absolute setup-session timeout is needed alongside inactivity return. Serial factory erase is a separate intentional reset mechanism; a portal reset action is optional follow-up, not an implemented feature.
+Provision and validate DNS independently of the gateway; reject malformed/non-unicast addresses, invalid masks/routes/ports and known client-IP collisions; document DHCP exclusions and safe configuration migration/failed saves. Review broker ACLs, TLS/trusted-time and credential storage (secure boot/flash encryption are not claimed). Verify inactivity expiry and the absolute configured-session deadline on hardware. Serial factory erase is a separate intentional reset mechanism; a portal reset action is optional follow-up, not an implemented feature.
 
 PR #4 implements local recovery, isolated MQTT and route authentication at this head. Intentional queue-cap/throttle and offline drops remain telemetry, not watchdog failure evidence. Verify shared-MAC IPv4/ARP receive paths, cold boot, DHCP/DNS/broadcasts, bidirectional Modbus, idle client, broker outage/reconnect, Wi-Fi loss/recovery, settings-preserving setup, NVS migration and OTA rollback on the actual WT32/4 MB board. Not hardware-tested.
