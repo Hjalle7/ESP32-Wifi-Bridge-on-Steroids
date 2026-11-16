@@ -197,13 +197,17 @@ struct BridgeConfig {
    * 81 degC at sustained full load, so a higher value (e.g. 90) keeps the
    * throttle as a guard against real overheating only. Live. */
   uint8_t  thr_temp_c;
+
+  /* Start beyond the legacy tail padding so short blobs cannot replace
+   * this default with padding bytes from the previous struct layout. */
+  alignas(uint32_t) uint8_t ip_profile; /* explicit IP profile: 0, 1 or 2 */
 };
 
 extern BridgeConfig g_cfg;
 
-/* Load the configuration from NVS into g_cfg; falls back to defaults if
- * nothing (valid) is stored. */
-void cfg_load(void);
+/* Return false for unreadable/missing commissioned configuration. Only an
+ * absent namespace without a commissioning marker permits initial setup. */
+bool cfg_load(void);
 /* Write g_cfg to NVS. Returns false if NVS could not be opened or written. */
 bool cfg_save(void);
 /* Fill *c with factory defaults. */

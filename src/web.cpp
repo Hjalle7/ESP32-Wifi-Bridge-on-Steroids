@@ -19,6 +19,9 @@
  */
 
 #include "web.h"
+#include <mutex>
+#include <sys/socket.h>
+#include "provisioning_session.h"
 #include "config.h"
 #include "bridge.h"
 
@@ -35,6 +38,8 @@
 #include "esp_rom_sys.h"
 #include "bootloader_random.h"
 #include "nvs.h"
+#include "mbedtls/base64.h"
+#include "provisioning_auth.h"
 #include "esp_core_dump.h"
 #include "build_info.h"
 #include "crashlog.h"
@@ -44,10 +49,58 @@
 /* Separate from the configuration blob so ordinary edits preserve the AP
  * credential without changing the append-only BridgeConfig layout. */
 static char s_ap_password[33] = {};
+/* Snapshot credentials for this session; saving a new admin password takes
+ * effect on the next provisioning boot, never halfway through a request. */
+static char s_http_password[33] = {};
+static char s_http_basic[96] = {};
 
 static httpd_handle_t s_httpd = NULL;
 static bool           s_provisioning = false;
 static uint32_t       s_last_activity_ms = 0;
+static uint32_t       s_session_started_at = 0;
+static bool           s_session_configured = false;
+
+// Serialize admission, cancellation and boot-selection commits. Never hold
+// this mutex across socket reads or OTA erase/write operations.
+static std::mutex s_ota_mutex;
+static bool s_expired = false, s_ota_active = false;
+static int s_ota_socket = -1;
+void web_expire(void) {
+  std::lock_guard<std::mutex> lock(s_ota_mutex);
+  s_expired = true;
+  if (s_ota_socket >= 0) shutdown(s_ota_socket, SHUT_RDWR);
+}
+bool web_exit_requested(void) {
+  std::lock_guard<std::mutex> lock(s_ota_mutex);
+  return s_expired;
+}
+bool web_shutdown_ready(void) {
+  std::lock_guard<std::mutex> lock(s_ota_mutex);
+  return !s_ota_active;
+}
+static bool session_closed(void) {
+  return s_expired || provisioning_session_expired(s_session_configured, s_session_started_at, millis());
+}
+struct OtaSession {
+  bool admitted = false;
+  explicit OtaSession(httpd_req_t *r) {
+    std::lock_guard<std::mutex> lock(s_ota_mutex);
+    if (!session_closed() && !s_ota_active) {
+      s_ota_active = admitted = true;
+      s_ota_socket = httpd_req_to_sockfd(r);
+    }
+  }
+  bool cancelled() {
+    std::lock_guard<std::mutex> lock(s_ota_mutex);
+    return session_closed();
+  }
+  ~OtaSession() {
+    if (!admitted) return;
+    std::lock_guard<std::mutex> lock(s_ota_mutex);
+    s_ota_socket = -1;
+    s_ota_active = false; // acknowledgement after the handler releases OTA resources
+  }
+};
 
 uint32_t web_last_activity_ms(void) { return s_last_activity_ms; }
 
@@ -191,16 +244,30 @@ static bool form_get(const char *body, const char *key, char *out, size_t out_le
   return false;
 }
 
-/* Escape a string for use inside a JSON string literal (" and \ only).
- * Passwords are never output, but SSIDs and names are. The output can be up
- * to twice as long as the input. */
-static void json_escape(const char *in, char *out, size_t out_len) {
+/* JSON control bytes need up to six bytes (\u00XX), plus the final NUL.
+ * Bounded callers retain a valid escaped prefix: never split an escape.
+ * An explicit input length also supports embedded NUL bytes. */
+static bool json_escape(const char *in, char *out, size_t out_len,
+                        size_t in_len = SIZE_MAX) {
+  if (!out_len) return false;
+  if (in_len == SIZE_MAX) in_len = strlen(in);
+  static const char hex[] = "0123456789abcdef";
   size_t o = 0;
-  for (size_t i = 0; in[i] && o + 2 < out_len; i++) {
-    if (in[i] == '"' || in[i] == '\\') out[o++] = '\\';
-    out[o++] = in[i];
+  out[0] = '\0';
+  for (size_t i = 0; i < in_len; i++) {
+    const unsigned char c = (unsigned char)in[i];
+    const size_t need = c < 0x20 ? 6 : (c == '"' || c == '\\' ? 2 : 1);
+    if (need >= out_len - o) return false;
+    if (c < 0x20) {
+      out[o++] = '\\'; out[o++] = 'u'; out[o++] = '0'; out[o++] = '0';
+      out[o++] = hex[c >> 4]; out[o++] = hex[c & 15];
+    } else {
+      if (c == '"' || c == '\\') out[o++] = '\\';
+      out[o++] = (char)c;
+    }
+    out[o] = '\0';
   }
-  out[o] = '\0';
+  return true;
 }
 
 /* ===========================================================================
@@ -319,6 +386,8 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
   <h2>Configuration</h2>
   <label>Device name</label><input id="name">
 
+  <label>Telemetry IP profile (explicit selection, no gateway probing)</label>
+  <select id="ip_profile"><option value="0">Profile 1</option><option value="1">Profile 2</option><option value="2">Profile 3</option></select>
   <div class="tag live" style="background:rgba(77,163,255,.15);color:var(--acc)">Network 1</div>
   <label>Wi-Fi <a href="#" onclick="scan();return false" style="color:var(--acc)">(scan)</a></label>
   <div class="row"><input id="ssid1" list="nets" placeholder="SSID">
@@ -341,9 +410,9 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
   <label>Management IP <span class="hint">empty = use the same settings as network 1</span></label>
   <div class="row"><input id="ip3" placeholder="IP"><input id="mask3" placeholder="Netmask"><input id="gw3" placeholder="Gateway"></div>
   <div class="sub" style="margin:6px 0 0">
-    For several sites: the bridge tries the configured networks and applies
-    the IP settings of the network it actually ended up in (detected by
-    pinging each gateway). The same configuration then works at every site.
+    Select the telemetry IP profile for this network before leaving setup.
+    Wi-Fi networks may fail over, but the selected IP profile stays fixed.
+    An empty optional profile falls back to profile 1.
   </div>
 
   <label>MQTT broker (empty = off)</label>
@@ -351,7 +420,7 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
   <div class="row"><input id="mqtt_user" placeholder="User"><input id="mqtt_pass" type="password" placeholder="Password"></div>
 
   <label>Telemetry interval (s)</label><input id="telemetry_s">
-  <label>Admin key (protects firmware update and crash data, empty = open)</label>
+  <label>Admin password (all setup pages and APIs; effective next setup boot)</label>
   <input id="admin_pass" type="password" placeholder="leave empty = unchanged">
 
   <button class="hold" data-act="saverb">Save &amp; reboot</button>
@@ -568,16 +637,12 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
   <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
     <b style="font-size:13px">Watchdog</b>
     <div class="sub" style="margin:4px 0 8px">
-      Detects when the bridge stops delivering properly despite being
-      "connected", and escalates in up to three levels depending on the
-      symptom: <b>Ethernet link up, but no traffic from the camera</b>
-      &rarr; only the Ethernet driver is restarted (Wi-Fi stays untouched);
-      <b>Wi-Fi-side problems</b> (high loss rate, frequent reassociations,
-      failed gateway probe) &rarr; disconnect and reconnect Wi-Fi
-      (Ethernet/camera stay untouched); <b>if none of that helps</b> &rarr;
-      full reboot with a deliberate coredump, so the reason can be traced
-      afterwards. None of this counts as a failed boot for the boot-loop
-      protection.
+      Uses local link state and forwarding errors only. Quiet clients and
+      unplugged cables never trigger recovery. Wi-Fi disassociation requests
+      reconnects; sustained Ethernet transmit failures can restart Ethernet.
+      Persistent forwarding errors may escalate to a coredump reboot, limited
+      to two reboots until ten healthy minutes. Actions are at least a minute
+      apart. Local checks cannot prove end-to-end network reachability.
     </div>
     <select id="wd_enable">
       <option value="0">Off (default)</option>
@@ -736,7 +801,7 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     falls back to the previous version.
   </div>
   <input type="file" id="fw" accept=".bin">
-  <label>Admin key</label><input id="okey" type="password">
+  <label>Optional explicit key (browser login also works)</label><input id="okey" type="password">
   <div class="bar" style="margin-top:12px"><i id="pbar" style="width:0"></i></div>
   <button onclick="upload()">Upload &amp; flash</button>
   <div id="omsg"></div>
@@ -770,7 +835,7 @@ const TD=(t,h)=>'<'+(h?'th':'td')+' style="text-align:left;padding:2px 6px;borde
 /* esp_reset_reason_t -> plain text. 255 = imported from before the history existed. */
 const RST={4:'Crash (panic)',5:'Interrupt watchdog',6:'Task watchdog',7:'Hardware watchdog',9:'Brownout (voltage)',14:'Power glitch',15:'CPU lockup',255:'Crash (imported)'};
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
-/* Load the crash history (admin key from the firmware field, if set). */
+/* Load crash history using the browser login or optional explicit key. */
 async function checkCrashes(){
   try{
     const r=await fetch('/api/crashes',{headers:cdHeaders()});
@@ -933,7 +998,7 @@ async function tick(){
       (s.wd_eth_resets ? ' &middot; Watchdog Ethernet resets: <b>'+s.wd_eth_resets+'</b>' : '')+
       (s.roam_count ? ' &middot; AP switches (roaming): <b>'+s.roam_count+'</b>' : '')+
       (s.wd_last_reason ? ' &middot; last watchdog reboot: <span class="bad">'+
-        (['','loss ratio','reconnects','gateway probe','no camera traffic'][s.wd_last_reason]||'?')+'</span>' : '')+
+        (['','loss ratio','reconnects','Wi-Fi disconnected','Ethernet transmit errors'][s.wd_last_reason]||'?')+'</span>' : '')+
       ' &middot; Heap: <b>'+Math.round(s.heap/1024)+' kB</b>'+
       (s.heap_min!==undefined
         ? ' (minimum '+Math.round(s.heap_min/1024)+' kB, DMA '+
@@ -946,7 +1011,7 @@ async function tick(){
 /* One field name per entry, in exactly this order when saving too.
    Password fields are deliberately NOT part of load() - they never come
    back from the board; an empty field means "leave unchanged" on save. */
-const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','ip3','mask3','gw3',
+const CFG=['ip_profile','name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','ip3','mask3','gw3',
            'mqtt_host','mqtt_port','mqtt_user','telemetry_s',
            'tx_power','eth_tx_retries','wifi_tx_retries',
            'static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win',
@@ -971,13 +1036,20 @@ async function load(){
 }
 async function scan(){
   $('msg').textContent='Scanning...';
-  const r=await(await fetch('/api/scan')).json();
-  /* Via DOM instead of innerHTML: SSIDs are untrusted data, a neighbor AP
-     named "<img src=x onerror=...>" would otherwise run script in the portal. */
-  const d=$('nets');d.textContent='';
-  r.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;
-    o.textContent=n.ssid+' ('+n.rssi+' dBm)';d.appendChild(o)});
-  $('msg').textContent=r.length+' networks found';
+  try{
+    const response=await fetch('/api/scan');
+    if(!response.ok)throw new Error('Scan request failed');
+    const r=await response.json();
+    if(!Array.isArray(r)||!r.every(n=>n&&typeof n.ssid==='string'&&Number.isFinite(n.rssi)))
+      throw new Error('Invalid scan response');
+    /* SSIDs are untrusted; create DOM nodes rather than interpreting HTML. */
+    const d=$('nets');d.textContent='';
+    r.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;
+      o.textContent=n.ssid+' ('+n.rssi+' dBm)';d.appendChild(o)});
+    $('msg').textContent=r.length+' networks found';
+  }catch(e){
+    $('msg').textContent='Scan failed. Try again or enter the SSID manually.';
+  }
 }
 /* rb=true -> save and reboot (Wi-Fi credentials, IP, buffers...).
    rb=false -> save only; TX power and retries take effect immediately, the
@@ -1505,12 +1577,10 @@ static esp_err_t h_config_get(httpd_req_t *r) {
   if (g_cfg.mgmt_gw3[0] || g_cfg.mgmt_gw3[1] || g_cfg.mgmt_gw3[2] || g_cfg.mgmt_gw3[3])
     format_ipv4(g_cfg.mgmt_gw3, gw3, sizeof(gw3));
 
-  /* mu must hold the ESCAPED user name: json_escape() prefixes every " and \
-   * with a backslash, so in the worst case the length doubles. With 64
-   * usable characters that is 128 plus the NUL byte - a smaller buffer would
-   * silently truncate the name, and only for long values, i.e. exactly when
-   * nobody tests it. */
-  char n[64], s1[80], s2[80], s3[80], mh[128], mu[136];
+  /* All user strings can expand to six bytes per input byte. */
+  char n[6 * sizeof(g_cfg.name) + 1];
+  char s1[6 * sizeof(g_cfg.ssid1) + 1], s2[sizeof(s1)], s3[sizeof(s1)];
+  char mh[6 * sizeof(g_cfg.mqtt_host) + 1], mu[6 * sizeof(g_cfg.mqtt_user) + 1];
   json_escape(g_cfg.name,      n,  sizeof(n));
   json_escape(g_cfg.ssid1,     s1, sizeof(s1));
   json_escape(g_cfg.ssid2,     s2, sizeof(s2));
@@ -1522,15 +1592,17 @@ static esp_err_t h_config_get(httpd_req_t *r) {
   bridge_get_effective(&eff);
   bridge_get_defaults(&def);
 
-  /* Passwords are deliberately never returned.
-   * Buffer size: name, three SSIDs, nine IP addresses from three profiles,
-   * host, escaped user name and the tuning numbers add up to roughly
-   * 1750 bytes in the worst case. snprintf truncates cleanly, but a truncated
-   * JSON is unparsable - the form would simply stay empty. Grow this buffer
-   * when adding fields. */
-  char buf[2048];
-  snprintf(buf, sizeof(buf),
-    "{\"name\":\"%s\",\"ssid1\":\"%s\",\"ssid2\":\"%s\",\"ssid3\":\"%s\","
+  /* Passwords are deliberately never returned. Keep the expanded response
+   * off the HTTP task stack; reserve 2048 bytes for keys, IPs and numbers. */
+  const size_t cap = sizeof(n) + sizeof(s1) + sizeof(s2) + sizeof(s3)
+                   + sizeof(mh) + sizeof(mu) + 2048;
+  char *buf = (char *)malloc(cap);
+  if (!buf) {
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    return ESP_FAIL;
+  }
+  const int written = snprintf(buf, cap,
+    "{\"ip_profile\":%u,\"name\":\"%s\",\"ssid1\":\"%s\",\"ssid2\":\"%s\",\"ssid3\":\"%s\","
     "\"ip\":\"%s\",\"mask\":\"%s\",\"gw\":\"%s\","
     "\"ip2\":\"%s\",\"mask2\":\"%s\",\"gw2\":\"%s\","
     "\"ip3\":\"%s\",\"mask3\":\"%s\",\"gw3\":\"%s\","
@@ -1552,7 +1624,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"wd_actions\":%u,\"wd_bad_windows\":%u},"
     "\"eff\":{\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u}}",
-    n, s1, s2, s3, ip, mask, gw, ip2, mask2, gw2, ip3, mask3, gw3,
+    (unsigned)(g_cfg.ip_profile <= 2 ? g_cfg.ip_profile : 0), n, s1, s2, s3, ip, mask, gw, ip2, mask2, gw2, ip3, mask3, gw3,
     mh, g_cfg.mqtt_port, mu, g_cfg.telemetry_s,
     /* Return the EFFECTIVE values, not the stored 0 - the form should show
      * what is running. On save the number is then stored explicitly; the
@@ -1586,9 +1658,16 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     def.wd_actions, def.wd_bad_windows,
     eff.static_rx, eff.dyn_rx, eff.dyn_tx, eff.ba_win);
 
+  if (written < 0 || (size_t)written >= cap) {
+    free(buf);
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON response too large");
+    return ESP_FAIL;
+  }
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
-  return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+  const esp_err_t err = httpd_resp_send(r, buf, written);
+  free(buf);
+  return err;
 }
 
 /* POST /api/config - parse the form-urlencoded body, validate and clamp
@@ -1620,6 +1699,13 @@ static esp_err_t h_config_post(httpd_req_t *r) {
    * would silently store a truncated 64-character password with a few
    * special characters. 3 x 64 + NUL covers the worst case. */
   char v[200];
+  if (form_get(body, "ip_profile", v, sizeof(v))) {
+    if (strlen(v) != 1 || v[0] < '0' || v[0] > '2') {
+      httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "invalid IP profile");
+      return ESP_FAIL;
+    }
+    g_cfg.ip_profile = v[0] - '0';
+  }
   if (form_get(body, "name",  v, sizeof(v))) strncpy(g_cfg.name,  v, sizeof(g_cfg.name)  - 1);
   if (form_get(body, "ssid1", v, sizeof(v))) strncpy(g_cfg.ssid1, v, sizeof(g_cfg.ssid1) - 1);
   if (form_get(body, "ssid2", v, sizeof(v))) strncpy(g_cfg.ssid2, v, sizeof(g_cfg.ssid2) - 1);
@@ -1928,45 +2014,62 @@ static esp_err_t h_eth_reset(httpd_req_t *r) {
  * activity. */
 static esp_err_t h_scan(httpd_req_t *r) {
   s_last_activity_ms = millis();
+  httpd_resp_set_type(r, "application/json");
+  auto scan_error = [r]() {
+    httpd_resp_set_status(r, "500 Internal Server Error");
+    return httpd_resp_send(r, "{\"error\":\"Wi-Fi scan failed\"}", HTTPD_RESP_USE_STRLEN);
+  };
   wifi_scan_config_t sc = {};
   sc.show_hidden = false;
-
-  if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
-    httpd_resp_set_type(r, "application/json");
-    return httpd_resp_send(r, "[]", HTTPD_RESP_USE_STRLEN);
-  }
+  if (esp_wifi_scan_start(&sc, true) != ESP_OK) return scan_error();
 
   uint16_t n = 0;
-  esp_wifi_scan_get_ap_num(&n);
-  if (n > 20) n = 20;
-
-  wifi_ap_record_t *recs = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * n);
-  if (!recs) {
-    httpd_resp_set_type(r, "application/json");
+  if (esp_wifi_scan_get_ap_num(&n) != ESP_OK) {
+    esp_wifi_clear_ap_list();
+    return scan_error();
+  }
+  if (!n) {
+    esp_wifi_clear_ap_list();
     return httpd_resp_send(r, "[]", HTTPD_RESP_USE_STRLEN);
   }
-  esp_wifi_scan_get_ap_records(&n, recs);
-
-  httpd_resp_set_type(r, "application/json");
-  httpd_resp_sendstr_chunk(r, "[");
-  bool first = true;
-  for (uint16_t i = 0; i < n; i++) {
-    char esc[80], item[128];
-    json_escape((const char *)recs[i].ssid, esc, sizeof(esc));
-    if (!esc[0]) continue;
-    /* Tie the comma to the entry actually emitted, not to i - otherwise
-     * "[,{...}]" results as soon as the first hit is skipped, and the portal
-     * can no longer parse the list. */
-    snprintf(item, sizeof(item), "%s{\"ssid\":\"%s\",\"rssi\":%d}",
-             first ? "" : ",", esc, (int)recs[i].rssi);
-    first = false;
-    httpd_resp_sendstr_chunk(r, item);
+  if (n > 20) n = 20;
+  wifi_ap_record_t *recs = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * n);
+  if (!recs) {
+    esp_wifi_clear_ap_list();
+    return scan_error();
   }
-  httpd_resp_sendstr_chunk(r, "]");
-  httpd_resp_sendstr_chunk(r, NULL);
+  if (esp_wifi_scan_get_ap_records(&n, recs) != ESP_OK) {
+    free(recs);
+    esp_wifi_clear_ap_list();
+    return scan_error();
+  }
 
+  esp_err_t err = httpd_resp_sendstr_chunk(r, "[");
+  bool first = true;
+  for (uint16_t i = 0; i < n && err == ESP_OK; i++) {
+    /* SSIDs contain at most 32 bytes; do not depend on driver termination.
+     * Reserve six bytes per input byte, NUL, and room for JSON/RSSI. */
+    char esc[32 * 6 + 1], item[sizeof(esc) + 32];
+    const size_t len = strnlen((const char *)recs[i].ssid, 32);
+    if (!len) continue;
+    if (!json_escape((const char *)recs[i].ssid, esc, sizeof(esc), len)) {
+      err = ESP_FAIL;
+      break;
+    }
+    const int written = snprintf(item, sizeof(item), "%s{\"ssid\":\"%s\",\"rssi\":%d}",
+                                 first ? "" : ",", esc, (int)recs[i].rssi);
+    if (written < 0 || (size_t)written >= sizeof(item)) {
+      err = ESP_FAIL;
+      break;
+    }
+    err = httpd_resp_sendstr_chunk(r, item);
+    first = false;
+  }
   free(recs);
-  return ESP_OK;
+  if (err != ESP_OK) return err;
+  err = httpd_resp_sendstr_chunk(r, "]");
+  if (err != ESP_OK) return err;
+  return httpd_resp_sendstr_chunk(r, NULL);
 }
 
 
@@ -1979,15 +2082,55 @@ static esp_err_t h_scan(httpd_req_t *r) {
  * updates from the local network.
  * ========================================================================= */
 
-/* Minimal protection, shared by firmware update, coredump and crash history.
- * Over plain HTTP this is no real protection against someone sniffing the
- * traffic - but it prevents accidental flashing/reading and access from
- * devices that do not know the key. No admin_pass set = open. */
+/* Authenticate every route with HTTP Basic (browser login) or the header
+ * used by local OTA tools. An unset admin password uses the unique AP secret,
+ * never anonymous access. Only the precomputed session snapshot is compared. */
 static bool admin_key_ok(httpd_req_t *r) {
-  if (!g_cfg.admin_pass[0]) return true;
-  char key[48] = "";
-  return httpd_req_get_hdr_value_str(r, "X-Admin-Key", key, sizeof(key)) == ESP_OK &&
-         strcmp(key, g_cfg.admin_pass) == 0;
+  char key[96] = {};
+  if (httpd_req_get_hdr_value_str(r, "X-Admin-Key", key, sizeof(key)) == ESP_OK &&
+      provisioning_secret_equal(s_http_password, key)) return true;
+  if (httpd_req_get_hdr_value_str(r, "Authorization", key, sizeof(key)) != ESP_OK) return false;
+  return provisioning_secret_equal(s_http_basic, key);
+}
+
+/* Reject browser requests from other sites, including authenticated form
+ * posts. Command-line tools without browser provenance remain supported.
+ * Host and Origin must match exactly; HTTPS is not offered by this portal. */
+static bool same_origin_request(httpd_req_t *r) {
+  char site[32] = {};
+  if (httpd_req_get_hdr_value_len(r, "Sec-Fetch-Site")) {
+    if (httpd_req_get_hdr_value_str(r, "Sec-Fetch-Site", site, sizeof(site)) != ESP_OK) return false;
+    if (strcmp(site, "same-origin") && strcmp(site, "none")) return false;
+  }
+  if (!httpd_req_get_hdr_value_len(r, "Origin")) return true;
+  char host[80] = {}, origin[96] = {}, expected[96] = {};
+  if (httpd_req_get_hdr_value_str(r, "Host", host, sizeof(host)) != ESP_OK ||
+      httpd_req_get_hdr_value_str(r, "Origin", origin, sizeof(origin)) != ESP_OK) return false;
+  snprintf(expected, sizeof(expected), "http://%s", host);
+  return strcmp(origin, expected) == 0;
+}
+
+/* Single authentication boundary for root, configuration, diagnostics and
+ * OTA, including future registered routes. Do not execute a handler before
+ * authentication and origin checks; failed attempts never extend AP uptime. */
+static esp_err_t provisioning_dispatch(httpd_req_t *r) {
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  bool expired;
+  { std::lock_guard<std::mutex> lock(s_ota_mutex); expired = session_closed(); }
+  if (expired || !s_provisioning ||
+      provisioning_session_expired(s_session_configured, s_session_started_at, millis()) ||
+      !admin_key_ok(r)) {
+    httpd_resp_set_hdr(r, "WWW-Authenticate", "Basic realm=\"Bridge setup\"");
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "authentication required");
+    return ESP_FAIL;
+  }
+  if (!same_origin_request(r)) {
+    httpd_resp_send_err(r, HTTPD_403_FORBIDDEN, "cross-origin request rejected");
+    return ESP_FAIL;
+  }
+  const httpd_uri_t *route = static_cast<const httpd_uri_t *>(r->user_ctx);
+  r->user_ctx = route->user_ctx;
+  return route->handler(r);
 }
 
 /* POST /api/update - stream the request body into the next OTA partition,
@@ -1996,6 +2139,8 @@ static bool admin_key_ok(httpd_req_t *r) {
  * image boots as PENDING_VERIFY and is rolled back unless it confirms itself
  * (see main.cpp: ota_confirm_if_pending()). */
 static esp_err_t h_update(httpd_req_t *r) {
+  OtaSession session(r);
+  if (!session.admitted) return ESP_FAIL;
   if (!admin_key_ok(r)) {
     httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
     return ESP_FAIL;
@@ -2025,6 +2170,7 @@ static esp_err_t h_update(httpd_req_t *r) {
   esp_ota_handle_t ota = 0;
   esp_err_t err = esp_ota_begin(target, OTA_SIZE_UNKNOWN, &ota);
   if (err != ESP_OK) {
+    if (ota) esp_ota_abort(ota);
     bridge_set_paused(false);
     httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
     return ESP_FAIL;
@@ -2042,7 +2188,14 @@ static esp_err_t h_update(httpd_req_t *r) {
   bool header_checked = false;
 
   while (remaining > 0) {
+    if (session.cancelled()) {
+      free(buf); esp_ota_abort(ota); bridge_set_paused(false);
+      return ESP_FAIL;
+    }
     int n = httpd_req_recv(r, buf, remaining < 4096 ? remaining : 4096);
+    if (session.cancelled()) {
+      free(buf); esp_ota_abort(ota); bridge_set_paused(false); return ESP_FAIL;
+    }
     if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
     if (n <= 0) {
       free(buf); esp_ota_abort(ota); bridge_set_paused(false);
@@ -2072,6 +2225,9 @@ static esp_err_t h_update(httpd_req_t *r) {
   }
   free(buf);
 
+  if (session.cancelled()) {
+    esp_ota_abort(ota); bridge_set_paused(false); return ESP_FAIL;
+  }
   err = esp_ota_end(ota);
   if (err != ESP_OK) {
     bridge_set_paused(false);
@@ -2081,7 +2237,12 @@ static esp_err_t h_update(httpd_req_t *r) {
     return ESP_FAIL;
   }
 
-  err = esp_ota_set_boot_partition(target);
+  // Expiry cannot race boot metadata updates; reject a commit after deadline.
+  {
+    std::lock_guard<std::mutex> lock(s_ota_mutex);
+    if (session_closed()) { bridge_set_paused(false); return ESP_FAIL; }
+    err = esp_ota_set_boot_partition(target);
+  }
   if (err != ESP_OK) {
     bridge_set_paused(false);
     httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err));
@@ -2092,7 +2253,8 @@ static esp_err_t h_update(httpd_req_t *r) {
   httpd_resp_set_type(r, "application/json");
   httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
   delay(600);
-  bridge_restart_requested();
+  // Main owns shutdown after the RAII acknowledgement, including success.
+  web_expire();
   return ESP_OK;
 }
 
@@ -2146,10 +2308,10 @@ static esp_err_t h_coredump_get(httpd_req_t *r) {
 
   char reason[200] = "";
   esp_core_dump_get_panic_reason(reason, sizeof(reason));
-  char reason_esc[410];
+  char reason_esc[6 * sizeof(reason) + 1];
   json_escape(reason, reason_esc, sizeof(reason_esc));
 
-  char task_esc[40];
+  char task_esc[6 * sizeof(sum.exc_task) + 1];
   json_escape(sum.exc_task, task_esc, sizeof(task_esc));
 
   char bt[400] = "";
@@ -2175,14 +2337,25 @@ static esp_err_t h_coredump_get(httpd_req_t *r) {
   const bool corrupted = false;
 #endif
 
-  char buf[1280];
-  snprintf(buf, sizeof(buf),
+  const size_t cap = sizeof(reason_esc) + sizeof(task_esc) + sizeof(bt) + sizeof(extra) + 256;
+  char *buf = (char *)malloc(cap);
+  if (!buf) {
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory");
+    return ESP_FAIL;
+  }
+  const int written = snprintf(buf, cap,
     "{\"present\":true,\"readable\":true,\"corrupted\":%s,"
     "\"task\":\"%s\",\"pc\":\"0x%08lx\",\"reason\":\"%s\",\"bt\":[%s]%s}",
     corrupted ? "true" : "false",
     task_esc, (unsigned long)sum.exc_pc, reason_esc, bt, extra);
-
-  return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+  if (written < 0 || (size_t)written >= cap) {
+    free(buf);
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON response too large");
+    return ESP_FAIL;
+  }
+  const esp_err_t err = httpd_resp_send(r, buf, written);
+  free(buf);
+  return err;
 }
 
 /* DELETE /api/coredump - erase the stored coredump. */
@@ -2217,7 +2390,8 @@ static esp_err_t h_crashes_get(httpd_req_t *r) {
     return ESP_FAIL;
   }
   crash_rec_t *recs = (crash_rec_t *)malloc(sizeof(crash_rec_t) * CRASHLOG_N);
-  const size_t cap = 4608;
+  const size_t cap = CRASHLOG_N * (6 * (sizeof(recs[0].task)
+                   + sizeof(recs[0].reason) + sizeof(recs[0].build)) + 512) + 64;
   char *buf = (char *)malloc(cap);
   if (!recs || !buf) {
     free(recs); free(buf);
@@ -2229,7 +2403,8 @@ static esp_err_t h_crashes_get(httpd_req_t *r) {
   size_t o = snprintf(buf, cap, "{\"now\":%lu,\"recs\":[", (unsigned long)crashlog_now());
   for (size_t i = 0; i < n && o < cap; i++) {
     const crash_rec_t *c = &recs[i];
-    char task[40], reason[200], build[28];
+    char task[6 * sizeof(c->task) + 1], reason[6 * sizeof(c->reason) + 1];
+    char build[6 * sizeof(c->build) + 1];
     json_escape(c->task, task, sizeof(task));
     json_escape(c->reason, reason, sizeof(reason));
     json_escape(c->build, build, sizeof(build));
@@ -2246,7 +2421,11 @@ static esp_err_t h_crashes_get(httpd_req_t *r) {
       (unsigned long)c->pc, reason, bt);
   }
   if (o < cap) o += snprintf(buf + o, cap - o, "]}");
-  if (o >= cap) o = cap - 1;
+  if (o >= cap) {
+    free(recs); free(buf);
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON response too large");
+    return ESP_FAIL;
+  }
   free(recs);
 
   httpd_resp_set_type(r, "application/json");
@@ -2434,6 +2613,20 @@ bool web_start(bool provisioning) {
     return false;
   }
   s_provisioning = true;
+  s_session_started_at = millis();
+  s_session_configured = g_cfg.configured;
+  s_last_activity_ms = s_session_started_at;
+  const char *secret = g_cfg.admin_pass[0] ? g_cfg.admin_pass : s_ap_password;
+  if (!secret[0] || strnlen(secret, sizeof(s_http_password)) >= sizeof(s_http_password)) return false;
+  strcpy(s_http_password, secret);
+  char plain[40];
+  snprintf(plain, sizeof(plain), "admin:%s", secret);
+  size_t encoded = 0;
+  strcpy(s_http_basic, "Basic ");
+  if (mbedtls_base64_encode((unsigned char *)s_http_basic + 6, sizeof(s_http_basic) - 6,
+      &encoded, (const unsigned char *)plain, strlen(plain)) != 0) return false;
+  s_http_basic[6 + encoded] = '\0';
+  memset(plain, 0, sizeof(plain));
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;
@@ -2461,7 +2654,7 @@ bool web_start(bool provisioning) {
     return false;
   }
 
-  const httpd_uri_t uris[] = {
+  static const httpd_uri_t uris[] = {
     { "/",            HTTP_GET,  h_root,        NULL },
     { "/api/status",  HTTP_GET,  h_status,      NULL },
     { "/api/disconnects",HTTP_GET,h_disconnects,NULL },
@@ -2488,7 +2681,13 @@ bool web_start(bool provisioning) {
 #endif
   };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
-    httpd_register_uri_handler(s_httpd, &uris[i]);
+    httpd_uri_t route = uris[i];
+    route.handler = provisioning_dispatch;
+    route.user_ctx = (void *)&uris[i];
+    if (httpd_register_uri_handler(s_httpd, &route) != ESP_OK) {
+      httpd_stop(s_httpd); s_httpd = nullptr;
+      return false;
+    }
   }
 
   printf("[WEB ] HTTP server running\n");

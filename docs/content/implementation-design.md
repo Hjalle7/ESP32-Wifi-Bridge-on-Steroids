@@ -70,7 +70,7 @@ Build success does not demonstrate hardware compatibility or transparent forward
 
 ## Status and outstanding requirements
 
-PR #2 provides the design. This PR #3 slice adds the 4 MB target, non-destructive provisioning entry, unique AP credentials and provisioning-only management/OTA. PR #4 builds on it for local recovery, isolated MQTT and setup authentication; those changes are not present at this head or main. See the deployment guide for implementation limits; design sections above describe the target, not completion.
+PR #2 provides the design. This PR #3 slice adds the 4 MB target, non-destructive provisioning entry, unique AP credentials and provisioning-only management/OTA. PR #4 builds on it for local recovery, isolated MQTT and setup authentication, including separation of intentional drops from driver-failure health evidence. These changes are present at this stacked head, not main. See the deployment guide for implementation limits; design sections above describe the target, not completion.
 
 Before deployment, complete independent DNS provisioning, transactional configuration validation (netmask/routing, usable addresses, MQTT port and string limits), known-client collision checks and DHCP exclusion guidance. Decide maximum setup-session duration, update/rollback acceptance and credential-storage/TLS/broker-ACL tradeoffs explicitly. Secure boot and flash encryption are not claimed enabled. Qualify QE4-relevant profiles/tuning and local driver/queue/task fault detection without treating intentional rate limiting or idle traffic as faults.
 

@@ -21,10 +21,9 @@ struct BridgeStats {
   uint32_t kbps_wifi2eth;
   uint32_t wifi_disc_count;   /* WIFI_EVENT_STA_DISCONNECTED since boot, for
                                * the watchdog and for diagnosis in the portal */
-  uint8_t  wd_probe;          /* result of the last watchdog gateway probe:
-                               * 0=not needed/off, 1=ok, 2=failed             */
+  uint8_t  wd_probe;          /* legacy field, always zero (no IP probes) */
   uint32_t wd_eth_resets;     /* watchdog-triggered Ethernet resets since boot
-                               * (escalation level "no client traffic")       */
+                               * (local transmit failures)       */
   uint32_t wd_reconnects;     /* watchdog-triggered Wi-Fi reconnects since boot */
   uint8_t  wd_last_reason;    /* reason of the last forced watchdog reboot
                                * (highest escalation level): 0=none since
@@ -103,10 +102,13 @@ bool bridge_sniff_client_mac(uint32_t timeout_ms);
 
 /* Bring up Wi-Fi in STA mode with the cloned client MAC, including the
  * management netif with its static IP. Tries all configured SSIDs in order.
- * Returns false if none of them could be connected. */
+ * Returns true once initialized, even if association is still pending.
+ * Normal-mode ticks retry association without exposing management services. */
 bool bridge_wifi_start(void);
 
-/* Arm the data path (call only after a successful connect). */
+bool bridge_client_mac_known(void);
+
+/* Arm the data path after Wi-Fi initialization (association may be pending). */
 void bridge_activate(void);
 
 /* Must be called periodically from the main loop - drives the autotune,

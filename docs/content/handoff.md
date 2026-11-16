@@ -2,7 +2,9 @@
 
 ## Deployment fork planning status
 
-Only WT32-ETH01/4 MB is supported. Use `pio run -e wt32-eth01-4mb` and `python scripts/check_flash_layout.py wt32-eth01-4mb 4`; never use the retained legacy 8 MB/C5 builds for deployment. [wt32-deployment.md](wt32-deployment.md) records the initial implementation: 4 MB dual-slot layout, IO14 non-destructive provisioning, unique AP secret and no normal-mode HTTP/OTA/NetBIOS/SNTP; outbound IPv4/MQTT remains. Gateway-dependent watchdog/profile selection, synchronous MQTT and incomplete route authentication remain at this head; stacked PR #4 addresses them. Independent DNS, transactional validation, address-conflict safeguards, security decisions and hardware acceptance remain outstanding. Confirm flash ID, power and antenna physically. Not hardware-tested.
+Only WT32-ETH01/4 MB is supported. Use `pio run -e wt32-eth01-4mb` and `python scripts/check_flash_layout.py wt32-eth01-4mb 4`; never use the retained legacy 8 MB/C5 builds for deployment. [wt32-deployment.md](wt32-deployment.md) records the initial implementation: 4 MB dual-slot layout, IO14 non-destructive provisioning, unique AP secret and no normal-mode HTTP/OTA/NetBIOS/SNTP; outbound IPv4/MQTT remains. PR #4 removes gateway probing, selects IP profiles explicitly, isolates outbound MQTT and authenticates every registered setup route. Its watchdog counts failed driver transmits separately from intentional queue-cap/throttle and offline drops; telemetry totals remain unchanged. PR #4 also bounds pending OTA validation to three minutes after startup, requiring 30 continuous seconds of local readiness and falling back to an unconfirmed restart if the rollback API returns. Configured devices now require physical setup authorization even after boot/link/watchdog failures; initialized Wi-Fi retries in normal mode. Setup has both inactivity expiry and a 30-minute absolute deadline, with radio shutdown and a planned normal-mode reboot. First-time setup remains automatic and unlimited. Independent DNS, transactional validation, address-conflict safeguards, remaining security decisions and hardware acceptance remain outstanding. Confirm flash ID, power and antenna physically. Not hardware-tested.
+
+The provisioning scan now escapes all JSON control bytes, quotes and backslashes, reserves worst-case six-byte expansion, bounds driver SSID reads and rejects scan/retrieval/allocation failures with an HTTP error. The browser offers retry/manual entry on HTTP, network or malformed-response errors and preserves manual SSIDs. Other users of the shared escaper have matching buffer budgets. Run `python tests/test_scan.py` (requires g++ and Node.js): it executes the production escaper/handlers with ASan/UBSan, parses generated JSON, sweeps buffer boundaries and checks browser error recovery. All five existing host suites also pass. The WT32-ETH01 4 MB build passed on the pinned platform/ESP-IDF 5.5.1 with PlatformIO Core 6.1.18; the artifact checker verified 4 MB headers/Kconfig, partition bounds and 970192 / 1966080 bytes per OTA slot (49.3%). A negative control disabling control-byte escaping was rejected. The existing IRAM declaration warning remains. Not hardware-tested.
 
 ## Historical upstream snapshot (not deployment instructions)
 
@@ -57,3 +59,49 @@ See `backlog.md` — the boot-loop auto-recovery gap is closed now; it leads wit
 ## Safety net that has proven itself
 
 A firmware OTA'd into the inactive slot stays `PENDING_VERIFY` until it confirms itself after 30 s of *network-reachable* uptime, not just "booted" (see `ota_confirm_if_pending()`). Anything that doesn't confirm — a crash, or a build that deliberately omits the confirmation — is undone by a single power cycle. Proven repeatedly, most recently across three back-to-back OTA cycles on 2026-08-31 while building the coredump endpoint.
+
+
+## Security recovery correction after 8c8c812
+
+Recoverable Wi-Fi initialization/start errors now return to the inactive main loop.
+Partial startup removes handlers, stops/deinitializes the initialized driver and
+releases the default STA netif. Physical GPIO polling remains available; ordinary
+association exhaustion retains paced normal-mode retries and never opens setup.
+
+NVS initialization errors never erase flash. They leave management disabled;
+unreadable NVS requires deliberate local serial repair/erase. Readable but invalid
+configuration requires GPIO authorization for setup. A separate `provisioning`
+namespace commissioning marker is committed before saving configured settings and
+is added when loading legacy configured blobs. Missing configuration with that
+marker fails closed; missing blobs in an existing config namespace also fail closed.
+Saving an empty primary SSID cannot clear the commissioning claim. Destructive
+reset remains a local serial operation, never an HTTP or automatic recovery action.
+
+Limitation: total NVS erasure/loss (or loss of both the namespace and marker) is
+indistinguishable from a new board. Automatic setup for new boards necessarily
+also covers that state. No guarantee of historical configuration survives complete
+NVS loss; stronger discrimination requires an independently provisioned persistent
+anchor (for example manufacturing enrollment/eFuse), not another NVS key. Such an
+irreversible enrollment scheme is not implemented. Legacy devices cannot acquire
+historical evidence if configuration was already lost before this firmware ran.
+
+Expiry now revokes HTTP/OTA admission, shuts down the active upload socket to wake
+its receiver, and waits for the handler to abort/end OTA and release its buffer
+before stopping Wi-Fi and rebooting. Boot selection is serialized with expiry and
+checks the absolute deadline. Authorization ends at 30 minutes even while cleanup
+is pending; cleanup does not grant more requests or renew the session. OTA success
+uses the same acknowledged main-task shutdown, including first-time setup.
+
+Host tests include storage/read/marker faults, lost blobs, legacy migration,
+Wi-Fi fallback and partial-start cleanup, and OTA admission/cancellation acknowledgement.
+Negative controls restore fatal init, missing-marker bypass and expired admission.
+Target acceptance still requires actual socket wakeup, flash cancellation/commit,
+GPIO, Wi-Fi driver cleanup, bootloader rollback, heap/stack and QE4 traffic testing.
+
+Validation of this correction: all seven existing host suites plus the new recovery
+fault suite passed. Five negative controls (fatal Wi-Fi init, missing-config bypass,
+expired OTA admission, repeated-failure provisioning, and removed absolute deadline)
+were rejected. The WT32-ETH01 4 MB build and flash-layout checker passed with
+PlatformIO 6.1.18 / pinned platform 55.3.34 / ESP-IDF 5.5.1: 977312 bytes of
+1966080 per OTA slot (49.7%), matching 4 MB headers/Kconfig and valid partition
+bounds. The pre-existing IRAM attribute warning remains. Not hardware-tested.

@@ -65,7 +65,7 @@ Do not assume any checklist item is still present after PR #2–#4. Review the a
 - `platformio.ini`, `sdkconfig.defaults`, `sdkconfig.wt32-eth01`, partition CSV files: inspect **actual** build settings; inherited 8 MB/C5 definitions need cleanup as separate implementation work.
 - `src/bridge.cpp`: Ethernet/Wi-Fi forwarding, MAC cloning, network callbacks, watchdog.
 - `src/config.cpp` / `src/config.h`: persisted configuration and NVS compatibility.
-- `src/web.cpp`: provisioning-only portal/API; full route authentication is still required in stacked PR #4.
+- `src/web.cpp`: provisioning-only portal/API with authentication on all registered routes.
 - `src/telemetry.cpp`: MQTT state and Home Assistant discovery.
 - `src/main.cpp`: startup, provisioning lifecycle, recovery/OTA confirmation.
 - `docs/content/handoff.md`, `docs/content/backlog.md`, `docs/content/history.md`: inherited implementation notes and history; they may describe the original camera/8 MB/C5 setup and **are not current requirements for this fork**. Update handoff/backlog when implementation status changes.
@@ -85,6 +85,8 @@ Do not assume any checklist item is still present after PR #2–#4. Review the a
 
 ## Status at this stacked PR head
 
-PR #3 adds the 4 MB build/dual-slot layout, IO14 non-destructive setup, unique AP credentials and provisioning-only HTTP/OTA (no normal-mode NetBIOS/SNTP). Factory erase is a separate serial-tool operation. OTA confirmation uses 30 seconds of local readiness; hardware rollback acceptance remains outstanding. Gateway-based watchdog/profile selection, synchronous MQTT and incomplete route authentication remain at this head and are addressed by stacked PR #4. The migration checklist above still requires verification; it is not a claim that every legacy behavior remains.
+PR #3 adds the 4 MB build/dual-slot layout, IO14 non-destructive setup, unique AP credentials and provisioning-only HTTP/OTA (no normal-mode NetBIOS/SNTP). Factory erase is a separate serial-tool operation. OTA confirmation uses 30 seconds of local readiness; hardware rollback acceptance remains outstanding.
 
-Independent DNS provisioning, transactional validation/address-conflict safeguards, setup duration/security policy decisions and the QE4 hardware acceptance matrix remain open. See `docs/content/wt32-deployment.md`. Not hardware-tested.
+PR #4 removes gateway probing for watchdog/profile selection, isolates MQTT publishing behind a bounded zero-wait queue and authenticates all registered setup routes. Local recovery excludes intentional queue-cap/throttle and offline drops; failed driver transmits remain detectable. The migration checklist above still requires verification; it is not a claim that every legacy behavior remains.
+
+Independent DNS provisioning, transactional validation/address-conflict safeguards, setup duration/security policy decisions and the QE4 hardware acceptance matrix remain open. See `docs/content/local-recovery-and-access.md`. Not hardware-tested.
